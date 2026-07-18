@@ -19,3 +19,7 @@ export async function createJob(prisma: PrismaClient, data: CreateJobInput) {
     },
   });
 }
+
+export async function deleteJob(prisma: PrismaClient, id: string) {
+  await prisma.job.delete({ where: { id } });
+}

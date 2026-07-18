@@ -4,7 +4,9 @@ import { env } from './config/env';
 import { healthRoutes } from './routes/health';
 import { jobRoutes } from './routes/jobs';
 import { createPrismaClient } from './db/client';
+import { createRedisClient } from './queue/redis';
 import type { PrismaClient } from './generated/prisma/client';
+import type Redis from 'ioredis';
 
 /**
  * Separating "build the app" from "start listening" is a small decision
@@ -14,15 +16,18 @@ import type { PrismaClient } from './generated/prisma/client';
  * between parallel test files, no network flakiness, and it's fast because
  * there's no actual socket I/O.
  *
- * `prisma` is an optional dependency, not a hard-coded import: production
- * (server.ts) lets buildApp() create its own client and takes ownership of
- * closing it. Tests can instead inject a shared client they manage
- * themselves — in which case buildApp() must NOT close it on app.close(),
- * since a shared client is still needed by the next test in the file.
+ * `prisma` and `redis` are optional dependencies, not hard-coded imports:
+ * production (server.ts) lets buildApp() create its own clients and takes
+ * ownership of closing them. Tests can instead inject shared clients they
+ * manage themselves — in which case buildApp() must NOT close them on
+ * app.close(), since a shared client is still needed by the next test in
+ * the file.
  */
-export function buildApp(deps: { prisma?: PrismaClient } = {}): FastifyInstance {
+export function buildApp(deps: { prisma?: PrismaClient; redis?: Redis } = {}): FastifyInstance {
   const prisma = deps.prisma ?? createPrismaClient();
   const ownsPrisma = deps.prisma === undefined;
+  const redis = deps.redis ?? createRedisClient();
+  const ownsRedis = deps.redis === undefined;
 
   const app = Fastify({
     logger: {
@@ -66,8 +71,14 @@ export function buildApp(deps: { prisma?: PrismaClient } = {}): FastifyInstance 
     });
   }
 
+  if (ownsRedis) {
+    app.addHook('onClose', async () => {
+      await redis.quit();
+    });
+  }
+
   app.register(healthRoutes);
-  app.register(jobRoutes, { prisma });
+  app.register(jobRoutes, { prisma, redis });
 
   return app;
 }

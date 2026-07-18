@@ -1,11 +1,14 @@
 import { buildApp } from '../app';
 import { createPrismaClient } from '../db/client';
+import { createRedisClient } from '../queue/redis';
+import { JOBS_STREAM_KEY } from '../queue/stream';
 
 describe('POST /jobs', () => {
   // Shared across tests in this file, not per-test: buildApp() only closes
-  // a Prisma client it created itself (see app.ts), so it's this file's job
-  // to disconnect it once, after every test that uses it has finished.
+  // clients it created itself (see app.ts), so it's this file's job to
+  // dispose of them once, after every test that uses them has finished.
   const prisma = createPrismaClient();
+  const redis = createRedisClient();
   const createdJobIds: string[] = [];
 
   afterAll(async () => {
@@ -13,10 +16,11 @@ describe('POST /jobs', () => {
       await prisma.job.deleteMany({ where: { id: { in: createdJobIds } } });
     }
     await prisma.$disconnect();
+    await redis.quit();
   });
 
-  it('creates a job and persists it', async () => {
-    const app = buildApp({ prisma });
+  it('creates a job, persists it, and enqueues it onto the Redis stream', async () => {
+    const app = buildApp({ prisma, redis });
 
     const response = await app.inject({
       method: 'POST',
@@ -38,11 +42,20 @@ describe('POST /jobs', () => {
     expect(row).not.toBeNull();
     expect(row?.type).toBe('send-email');
 
+    // Same logic for the stream side: prove the job was actually announced
+    // on the stream, not just that the handler didn't throw.
+    const entries = await redis.xrevrange(JOBS_STREAM_KEY, '+', '-', 'COUNT', 20);
+    const match = entries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === body.id);
+    expect(match).toBeDefined();
+    if (match) {
+      await redis.xdel(JOBS_STREAM_KEY, match[0]);
+    }
+
     await app.close();
   });
 
   it('rejects a request missing "type"', async () => {
-    const app = buildApp({ prisma });
+    const app = buildApp({ prisma, redis });
 
     const response = await app.inject({
       method: 'POST',
@@ -57,7 +70,7 @@ describe('POST /jobs', () => {
   });
 
   it('rejects a non-object payload', async () => {
-    const app = buildApp({ prisma });
+    const app = buildApp({ prisma, redis });
 
     const response = await app.inject({
       method: 'POST',
