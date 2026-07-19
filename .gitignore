@@ -3,6 +3,5 @@ dist
 coverage
 .env
 *.log
-CLAUDE.md
 
 /src/generated/prisma
