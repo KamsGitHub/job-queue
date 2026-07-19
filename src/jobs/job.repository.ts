@@ -1,4 +1,4 @@
-import { PrismaClient, Prisma } from '../generated/prisma/client';
+import { PrismaClient, Prisma, JobStatus } from '../generated/prisma/client';
 import type { CreateJobInput } from './job.schema';
 
 /**
@@ -22,4 +22,29 @@ export async function createJob(prisma: PrismaClient, data: CreateJobInput) {
 
 export async function deleteJob(prisma: PrismaClient, id: string) {
   await prisma.job.delete({ where: { id } });
+}
+
+export async function getJob(prisma: PrismaClient, id: string) {
+  return prisma.job.findUnique({ where: { id } });
+}
+
+export async function markJobRunning(prisma: PrismaClient, id: string) {
+  return prisma.job.update({
+    where: { id },
+    data: { status: JobStatus.RUNNING, startedAt: new Date() },
+  });
+}
+
+export async function markJobSucceeded(prisma: PrismaClient, id: string) {
+  return prisma.job.update({
+    where: { id },
+    data: { status: JobStatus.SUCCEEDED, finishedAt: new Date() },
+  });
+}
+
+export async function markJobFailed(prisma: PrismaClient, id: string, error: string) {
+  return prisma.job.update({
+    where: { id },
+    data: { status: JobStatus.FAILED, error, finishedAt: new Date() },
+  });
 }

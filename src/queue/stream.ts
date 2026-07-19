@@ -9,6 +9,35 @@ import type Redis from 'ioredis';
  */
 export const JOBS_STREAM_KEY = 'jobs:stream';
 
+/**
+ * A single consumer group for all workers. Multiple worker processes join
+ * this same group with distinct consumer names — Redis then load-balances
+ * stream entries across them, delivering each entry to exactly one
+ * consumer, rather than broadcasting it to every reader the way a plain
+ * XREAD would.
+ */
+export const CONSUMER_GROUP = 'workers';
+
+export async function ensureConsumerGroup(redis: Redis): Promise<void> {
+  try {
+    // Start from '0', not '$': a worker starting up must still see every
+    // job already sitting on the stream, not only ones added after the
+    // group is created — skipping pre-existing jobs would be a silent
+    // correctness bug for a job queue. MKSTREAM guards against the (edge
+    // case) where a worker starts before any job has ever been submitted
+    // and the stream doesn't exist yet.
+    await redis.xgroup('CREATE', JOBS_STREAM_KEY, CONSUMER_GROUP, '0', 'MKSTREAM');
+  } catch (err) {
+    // XGROUP CREATE is not naturally idempotent — recreating an existing
+    // group is an error, not a no-op — so every worker startup calling
+    // this needs to tolerate "already exists" specifically.
+    const alreadyExists = err instanceof Error && err.message.includes('BUSYGROUP');
+    if (!alreadyExists) {
+      throw err;
+    }
+  }
+}
+
 export async function enqueueJob(redis: Redis, jobId: string): Promise<string> {
   // ioredis types XADD's return as `string | null` because the `NOMKSTREAM`
   // option can return null when the stream doesn't exist yet — we never
