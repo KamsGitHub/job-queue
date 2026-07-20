@@ -23,6 +23,14 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   DATABASE_URL: z.string().url(),
   REDIS_URL: z.string().url(),
+  // Milestone 6 crash recovery: how often the worker sweeps the consumer
+  // group's PEL for stale entries (WORKER_STALE_SWEEP_INTERVAL_MS), and how
+  // long an entry must sit un-acked before it's considered abandoned by its
+  // original consumer and eligible to be reclaimed (WORKER_STALE_IDLE_MS).
+  // Both default to 5s — a placeholder, since there's no real job-duration
+  // data yet to calibrate against; revisit once real handlers exist.
+  WORKER_STALE_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
+  WORKER_STALE_IDLE_MS: z.coerce.number().int().positive().default(5000),
 });
 
 export type Env = z.infer<typeof envSchema>;

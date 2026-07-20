@@ -2,12 +2,24 @@ import os from 'node:os';
 import { createPrismaClient } from './db/client';
 import { createRedisClient } from './queue/redis';
 import { ensureConsumerGroup } from './queue/stream';
-import { processNextJob } from './queue/consumer';
+import { processNextJob, reclaimStaleEntries } from './queue/consumer';
 import { createLogger } from './logger';
+import { env } from './config/env';
 
 const logger = createLogger();
 const prisma = createPrismaClient();
 const redis = createRedisClient();
+
+// Redis processes a single client connection's commands strictly in
+// order — while `redis` has a BLOCK 5000 read outstanding in the main
+// loop below, any command sent on that SAME connection (e.g. the sweep's
+// XAUTOCLAIM/XACK) queues behind it and can't get a response until the
+// blocking read finally resolves. Confirmed directly: a PING sent right
+// after a BLOCK 5000 read on one connection took ~5s to resolve, not
+// ~1ms. `sweepRedis` is a separate connection (ioredis's .duplicate(),
+// same connection options) used only by the sweep, so its commands are
+// never stuck behind the main loop's blocking reads.
+const sweepRedis = redis.duplicate();
 
 // Unique per process, not per host: multiple workers can run on the same
 // machine (or in the same container replica set), and Redis needs a
@@ -16,9 +28,41 @@ const consumerName = `${os.hostname()}:${process.pid}`;
 
 let running = true;
 
+/**
+ * Crash recovery: every worker also sweeps the shared consumer group's PEL
+ * on its own timer, independent of (and running concurrently with) the
+ * main read loop below — coupling the sweep to the loop's BLOCK cadence
+ * would mean a single slow job delays the sweep by however long that job
+ * takes. Every live worker doing this means the group self-heals as long
+ * as at least one worker is up; there's no dedicated reaper role/process.
+ * `sweeping` guards against a sweep still running when the next interval
+ * tick fires (e.g. Postgres briefly slow) — skip rather than overlap.
+ */
+let sweeping: Promise<void> | null = null;
+
+function startStaleEntrySweep(): NodeJS.Timeout {
+  return setInterval(() => {
+    if (sweeping) {
+      return;
+    }
+    sweeping = reclaimStaleEntries(prisma, sweepRedis, logger, consumerName, env.WORKER_STALE_IDLE_MS)
+      .then(() => undefined)
+      .catch((err: unknown) => {
+        logger.error({ err }, 'Error while sweeping for stale PEL entries');
+      })
+      .finally(() => {
+        sweeping = null;
+      });
+  }, env.WORKER_STALE_SWEEP_INTERVAL_MS);
+}
+
 async function loop(): Promise<void> {
   await ensureConsumerGroup(redis);
-  logger.info({ consumerName }, 'Worker started, listening on jobs:stream');
+  const sweepTimer = startStaleEntrySweep();
+  logger.info(
+    { consumerName, sweepIntervalMs: env.WORKER_STALE_SWEEP_INTERVAL_MS, idleMs: env.WORKER_STALE_IDLE_MS },
+    'Worker started, listening on jobs:stream',
+  );
 
   while (running) {
     try {
@@ -31,6 +75,14 @@ async function loop(): Promise<void> {
       // failed read.
       logger.error({ err }, 'Unexpected error in worker loop; continuing');
     }
+  }
+
+  clearInterval(sweepTimer);
+  // The interval is stopped, but a sweep it already kicked off may still be
+  // running (reclaiming + reprocessing several entries can take a moment) —
+  // wait for it rather than disconnecting Postgres/Redis out from under it.
+  if (sweeping) {
+    await sweeping;
   }
 }
 
@@ -54,11 +106,13 @@ loop()
     logger.info('Worker loop exited, shutting down');
     await prisma.$disconnect();
     await redis.quit();
+    await sweepRedis.quit();
     process.exit(0);
   })
   .catch(async (err) => {
     logger.error({ err }, 'Worker crashed');
     await prisma.$disconnect();
     await redis.quit();
+    await sweepRedis.quit();
     process.exit(1);
   });

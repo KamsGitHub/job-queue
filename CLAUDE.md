@@ -22,8 +22,8 @@ OpenAPI/Swagger.
 
 **Phase 1 — Core Queue Mechanics**
 4. Redis Streams as queue transport — done
-5. Worker process & consumer groups ← **currently here, see status below**
-6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM)
+5. Worker process & consumer groups — done
+6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM) ← **currently here, see status below**
 7. Retry logic & backoff (exponential + jitter)
 8. Dead-letter queue
 
@@ -342,6 +342,104 @@ Not yet done, explicitly deferred to Milestone 6: `XCLAIM` / stale-
 consumer recovery, retry/backoff for failed jobs, and any policy for
 what eventually happens to entries left in the PEL. Also deferred:
 stream trimming/retention (noted as a gap back in M4, still unaddressed).
+
+## Status: Milestone 6 (Acknowledgment & Crash Recovery)
+
+Key framing decided before implementing: Redis Streams makes **no
+protocol-level distinction** between "this consumer crashed mid-job" and
+"this entry is un-acked for any other reason" (e.g. M5's un-acked failed
+jobs) — both just look like PEL entries idle past some threshold. So
+crash recovery and "what happens to a failed job" turn out to be the same
+mechanism: any live consumer notices an entry has been idle too long,
+steals it via reclaim, and reprocesses it from scratch, identically
+regardless of *why* it was stuck.
+
+Implemented:
+- `src/queue/consumer.ts` refactored: the shared per-entry logic (fetch
+  job, `markJobRunning`, dispatch to handler, ack-on-success /
+  leave-un-acked-on-failure) pulled out into `processEntry()`, used by
+  both `processNextJob()` (fresh `XREADGROUP` reads) and the new
+  `reclaimStaleEntries()` — guaranteeing reclaimed entries get *exactly*
+  the same treatment as freshly delivered ones, not a parallel code path
+  that could drift.
+- `reclaimStaleEntries(prisma, redis, logger, consumerName, idleMs,
+  count?)`: uses **`XAUTOCLAIM`**, not the roadmap's literal `XCLAIM` —
+  deliberate deviation. `XAUTOCLAIM` (Redis 6.2+, available on the
+  `redis:7-alpine` image already in use) does "scan the PEL for entries
+  idle ≥ idleMs, then claim them" as one atomic, cursor-paginated call.
+  The classic `XPENDING` (find stale entries) + `XCLAIM` (take them)
+  two-step has a real race — another consumer can claim the same entry
+  between your `XPENDING` read and your `XCLAIM` call — that `XAUTOCLAIM`
+  closes by doing both in a single round trip. Always scans from cursor
+  `'0'` rather than persisting a cursor across sweeps: if there are more
+  stale entries than `count` (10, not env-configurable — only the
+  interval and idle threshold were asked for), they're simply picked up
+  on the *next* sweep, since idle time only grows. Avoids needing any
+  cursor state for a sweep that already runs every few seconds.
+- Two new env vars (`src/config/env.ts`), both defaulting to **5000ms**
+  (a placeholder — no real job-duration data exists yet to calibrate
+  against): `WORKER_STALE_SWEEP_INTERVAL_MS` (how often a worker sweeps)
+  and `WORKER_STALE_IDLE_MS` (how long an entry must sit un-acked before
+  it's eligible for reclaim).
+- `src/worker.ts`: every worker sweeps on its own `setInterval`, running
+  concurrently with (not coupled to) its own main read loop — no
+  dedicated reaper process/role. The group self-heals as long as *any*
+  worker is alive. A `sweeping` guard skips a tick if the previous sweep
+  is still in flight rather than overlapping. Shutdown now also
+  `clearInterval`s the sweep timer and awaits any in-flight sweep before
+  disconnecting, alongside the existing "let the current read finish"
+  logic from M5.
+- Deliberately **no retry cap or backoff** — that's Milestone 7. Until
+  then, a permanently-failing job gets reclaimed and retried immediately
+  and unconditionally on every sweep. Flagged explicitly, not an
+  oversight.
+- Named but *not* solved: a crash between `markJobSucceeded` (Postgres)
+  and `XACK` (Redis) in `processEntry()`'s success path means a
+  `SUCCEEDED` job's entry could still be sitting un-acked — which the
+  reclaim sweep would then pick up and reprocess an already-successful
+  handler. Real at-least-once-delivery gap; exactly what Milestone 9
+  (idempotency) exists to close.
+- Tests (`src/queue/consumer.test.ts`): added two cases for
+  `reclaimStaleEntries`, simulating a dead consumer by reading an entry
+  as `'dead-consumer'` via a raw `XREADGROUP` call and never processing
+  it, then calling `reclaimStaleEntries` under the real `consumerName`
+  with `idleMs=0` (claim immediately, no need to sleep past a real
+  threshold in a test). Covers both outcomes: success (job reaches
+  `SUCCEEDED`, entry fully acked) and failure (job reaches `FAILED`,
+  entry still pending but **ownership verifiably transferred** to the
+  reclaiming consumer — checked via `XPENDING`'s consumer field, not just
+  "still pending somewhere").
+
+**Real bug caught during manual verification, not by the test suite** —
+worth recording in detail since it's a genuine Redis-client gotcha:
+`worker.ts` originally shared *one* ioredis connection across
+`ensureConsumerGroup`, the main loop's `XREADGROUP ... BLOCK 5000`, and
+the independent sweep timer's `XAUTOCLAIM`/`XACK` calls. Redis processes
+a single client connection's commands strictly in order — it will not
+respond to command N+1 until command N is fully answered. While the main
+loop had a `BLOCK 5000` read outstanding, any command the sweep sent on
+that *same* connection queued behind it, invisibly delayed by up to the
+full block duration. Symptom observed live: reclaiming a stale job and
+running its (near-instant) handler logged correctly, but "Job succeeded"
+didn't log until exactly 5 seconds later — the `XACK` was stuck in queue.
+Confirmed the mechanism in isolation before touching code: a `PING`
+issued immediately after a `BLOCK 5000` read on the same connection also
+took ~5089ms to resolve, not ~1ms. **Fix:** `sweepRedis =
+redis.duplicate()` — the sweep gets its own dedicated connection,
+separate from the one used for blocking reads. Standard rule for Redis
+clients: never share a connection between a blocking command and other
+concurrent commands. Re-verified live after the fix: reclaim → handler →
+ack all logged at the identical timestamp.
+
+Manually verified end-to-end, twice (once catching the bug above, once
+confirming the fix): submitted a job, used a throwaway script to read it
+onto the stream as `'dead-consumer'` (simulating a worker that died right
+after delivery, before doing any work), started a real worker with the
+real 5s/5s env defaults (not a test's `idleMs=0` shortcut), and watched
+it detect the stale entry on its very first sweep tick, reclaim it,
+reprocess it, and reach `SUCCEEDED` with an empty `XPENDING`. Also
+re-verified graceful `SIGTERM` shutdown still cleanly closes both Redis
+connections.
 
 ## Design decisions worth preserving
 
