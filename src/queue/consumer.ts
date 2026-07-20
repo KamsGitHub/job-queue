@@ -1,14 +1,16 @@
 import type Redis from 'ioredis';
 import type { PrismaClient } from '../generated/prisma/client';
 import type { Logger } from '../logger';
+import { env } from '../config/env';
 import { JOBS_STREAM_KEY, CONSUMER_GROUP } from './stream';
 import { getJob, markJobRunning, markJobSucceeded, markJobFailed } from '../jobs/job.repository';
 import { getHandler } from '../jobs/handlers';
+import { computeBackoffMs } from './backoff';
 
 export interface ProcessedJob {
   entryId: string;
   jobId: string;
-  outcome: 'succeeded' | 'failed';
+  outcome: 'succeeded' | 'failed' | 'deferred';
 }
 
 /**
@@ -54,9 +56,19 @@ function extractField(fields: string[], name: string): string | undefined {
  * Ack policy: only a successfully processed job is XACK'd. A job that
  * fails (unknown type, handler throws, or its Postgres row has vanished)
  * is deliberately left un-acked, to be picked up again by the next stale-
- * entry sweep. Milestone 7 owns adding an attempt cap and backoff — until
- * then, a permanently-failing job is retried immediately and unconditionally
- * on every sweep.
+ * entry sweep — but see the backoff check below for what happens then.
+ *
+ * Retry backoff (Milestone 7): reclaimStaleEntries()'s XAUTOCLAIM sweep
+ * still claims any PEL entry idle past WORKER_STALE_IDLE_MS, unchanged
+ * from Milestone 6 — that mechanism doesn't need to know anything about
+ * per-job backoff. Instead, Postgres's nextRetryAt is the actual retry
+ * clock: if it's still in the future, processEntry declines to re-run the
+ * handler at all and leaves the entry un-acked again, to be claimed (and
+ * declined again) on however many subsequent sweeps it takes until the
+ * deadline passes. That means claiming a job deep in backoff is cheap
+ * busywork for a while — a deliberate tradeoff for keeping Postgres as
+ * the single source of truth for "is this job allowed to run yet" rather
+ * than teaching the Redis-side claim logic about per-job backoff state.
  */
 async function processEntry(
   prisma: PrismaClient,
@@ -77,6 +89,26 @@ async function processEntry(
     return { entryId, jobId, outcome: 'failed' };
   }
 
+  // Checked separately from (and before) the backoff-window check below:
+  // once attempts reaches maxAttempts, nextRetryAt is set to null (see the
+  // catch block), which would otherwise fall through this guard entirely
+  // and let an exhausted job keep re-running its handler — and its
+  // attempts counter keep climbing past maxAttempts — forever, on every
+  // future sweep. Exhaustion must be a permanent stop, not just "no
+  // backoff scheduled."
+  if (job.attempts >= job.maxAttempts) {
+    logger.error(
+      { jobId, entryId, attempts: job.attempts, maxAttempts: job.maxAttempts },
+      'Job has exhausted its retry budget; leaving un-acked and giving up',
+    );
+    return { entryId, jobId, outcome: 'deferred' };
+  }
+
+  if (job.nextRetryAt && job.nextRetryAt.getTime() > Date.now()) {
+    logger.info({ jobId, entryId, nextRetryAt: job.nextRetryAt }, 'Job is still within its backoff window; deferring');
+    return { entryId, jobId, outcome: 'deferred' };
+  }
+
   await markJobRunning(prisma, jobId);
 
   try {
@@ -95,8 +127,16 @@ async function processEntry(
     return { entryId, jobId, outcome: 'succeeded' };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await markJobFailed(prisma, jobId, message);
-    logger.error({ jobId, entryId, type: job.type, err }, 'Job failed; left un-acked for the next stale-entry sweep');
+    const attempts = job.attempts + 1;
+    const exhausted = attempts >= job.maxAttempts;
+    const nextRetryAt = exhausted
+      ? null
+      : new Date(Date.now() + computeBackoffMs(attempts, env.WORKER_RETRY_BASE_MS, env.WORKER_RETRY_MAX_MS));
+    await markJobFailed(prisma, jobId, { error: message, attempts, nextRetryAt });
+    logger.error(
+      { jobId, entryId, type: job.type, err, attempts, maxAttempts: job.maxAttempts, nextRetryAt },
+      exhausted ? 'Job failed; max attempts exhausted, giving up' : 'Job failed; will retry after backoff',
+    );
     return { entryId, jobId, outcome: 'failed' };
   }
 }

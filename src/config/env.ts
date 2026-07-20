@@ -31,6 +31,12 @@ const envSchema = z.object({
   // data yet to calibrate against; revisit once real handlers exist.
   WORKER_STALE_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(5000),
   WORKER_STALE_IDLE_MS: z.coerce.number().int().positive().default(5000),
+  // Milestone 7 retry backoff: full-jitter exponential backoff — delay =
+  // random(0, min(WORKER_RETRY_MAX_MS, WORKER_RETRY_BASE_MS * 2^(attempts-1))).
+  // Both are placeholders, same as the stale-entry settings above, pending
+  // real job-duration data.
+  WORKER_RETRY_BASE_MS: z.coerce.number().int().positive().default(1000),
+  WORKER_RETRY_MAX_MS: z.coerce.number().int().positive().default(60000),
 });
 
 export type Env = z.infer<typeof envSchema>;

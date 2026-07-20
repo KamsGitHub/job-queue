@@ -23,8 +23,8 @@ OpenAPI/Swagger.
 **Phase 1 — Core Queue Mechanics**
 4. Redis Streams as queue transport — done
 5. Worker process & consumer groups — done
-6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM) ← **currently here, see status below**
-7. Retry logic & backoff (exponential + jitter)
+6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM) — done
+7. Retry logic & backoff (exponential + jitter) ← **currently here, see status below**
 8. Dead-letter queue
 
 **Phase 2 — Correctness Under Concurrency**
@@ -440,6 +440,92 @@ it detect the stale entry on its very first sweep tick, reclaim it,
 reprocess it, and reach `SUCCEEDED` with an empty `XPENDING`. Also
 re-verified graceful `SIGTERM` shutdown still cleanly closes both Redis
 connections.
+
+## Status: Milestone 7 (Retry Logic & Backoff)
+
+Key mechanism decision made before implementing: M6's `XAUTOCLAIM` sweep
+claims any PEL entry idle past `WORKER_STALE_IDLE_MS` (a single global
+threshold) — it has no way to express "wait longer for this specific
+entry based on how many times it's already failed." Real per-job
+exponential backoff needed one of two designs:
+- Rejected: switch to manual `XPENDING` (to read each entry's Redis-native
+  `deliveryCount`) + selective `XCLAIM` only for entries whose computed
+  backoff has elapsed. Reintroduces the two-round-trip race `XAUTOCLAIM`
+  was chosen in M6 specifically to avoid, and makes Redis's delivery count
+  — not Postgres — the attempt-tracking source of truth.
+- **Chosen: leave M6's sweep completely untouched**, gate the actual
+  retry decision in Postgres instead. The sweep keeps claiming on its
+  fixed cheap cadence; `processEntry()` checks the job's Postgres
+  `nextRetryAt` before running the handler and declines (leaving the
+  entry un-acked again) if it's not yet due. Postgres stays the single
+  clock for "is this job allowed to run yet," at the cost of claiming
+  (cheap, no real work) jobs that are still deep in backoff.
+
+Implemented:
+- New migration (`prisma/migrations/..._add_retry_tracking/`): `Job` gets
+  `attempts Int @default(0)`, `maxAttempts Int @default(5)`,
+  `nextRetryAt DateTime?` — flagged as reserved for this milestone all the
+  way back in M2's notes.
+- `src/queue/backoff.ts`: `computeBackoffMs(attempts, baseMs, capMs)` —
+  full jitter (AWS's well-known algorithm): `random(0, min(cap, base *
+  2^(attempts-1)))`. Spreads retries out instead of every failed job
+  waking up at the same instant. `WORKER_RETRY_BASE_MS` (1000) /
+  `WORKER_RETRY_MAX_MS` (60000) added to `src/config/env.ts`, same
+  placeholder-pending-real-data framing as M6's stale-entry settings.
+- `job.repository.ts`: `markJobRunning` now also clears `nextRetryAt` to
+  `null` — once a handler is actually about to run (first attempt or a
+  matured retry), any prior backoff deadline is stale. `markJobFailed`'s
+  signature changed from a bare `error: string` to `{ error, attempts,
+  nextRetryAt }` — attempts/backoff are computed by the caller
+  (`processEntry`), not the repository function.
+- `consumer.ts`'s `processEntry()` (shared by fresh reads and reclaimed
+  entries, per M6) gained **two** guards before running the handler, in
+  order:
+  1. `job.attempts >= job.maxAttempts` → permanently give up (`outcome:
+     'deferred'`), no further processing, ever.
+  2. `job.nextRetryAt` still in the future → defer for now (`outcome:
+     'deferred'`), to be claimed and re-checked on a later sweep.
+  `ProcessedJob.outcome` gained the `'deferred'` variant accordingly.
+- On failure: `attempts` increments; if the new count reaches
+  `maxAttempts`, `nextRetryAt` is set to `null` (exhausted, no further
+  retry scheduled) — otherwise it's set to `now + computeBackoffMs(...)`.
+
+**Real bug caught by tracing the logic before running it live, not by the
+test suite** (the tests as first written wouldn't have caught it either —
+worth recording why): the very first version only checked
+`nextRetryAt` to decide whether to defer. But the exhausted case *also*
+sets `nextRetryAt` to `null` — indistinguishable, from that check alone,
+from "no backoff needed, free to run now." An exhausted job would have
+kept re-running its handler and incrementing `attempts` **past**
+`maxAttempts`, forever, on every future sweep — silently recreating
+exactly the unbounded-retry problem this milestone exists to fix, just
+disguised as "working as intended" since the job would still show
+`FAILED` with a growing `attempts` count. Fixed by adding the explicit
+`attempts >= maxAttempts` guard *before* the backoff-window check, and
+added a test (`'stops scheduling retries once attempts reaches
+maxAttempts, and stays stopped on a later attempt'`) that verifies a
+*second*, later reclaim doesn't move `attempts` past 5 — not just that
+the exhausting call alone set `nextRetryAt` to `null`.
+
+Manually verified end-to-end with real timers (not a test's synthetic
+`idleMs=0`): submitted a job with an unregistered `type`, ran a real
+worker for ~40s, and watched `attempts` climb 1→4 across successive
+sweeps (each backoff window smaller than the 5s sweep interval, so it
+retried almost every tick), one genuine `'Job is still within its backoff
+window; deferring'` at attempt 4 (that backoff happened to exceed the
+next sweep), the exhausting 5th attempt, and then — the part that matters
+— `'Job has exhausted its retry budget'` on every subsequent sweep with
+`attempts` staying at exactly `5`, never climbing further. Also confirmed
+`XPENDING`'s Redis-native `deliveryCount` had reached `13` by the end
+(every sweep claims it regardless of whether `processEntry` actually
+reprocesses it) versus Postgres's `attempts: 5` — a concrete, observed
+number behind the "cheap busywork" tradeoff named above, not just a
+theoretical one.
+
+Not yet done, explicitly deferred to Milestone 8: what happens to a
+permanently-exhausted job (currently: `FAILED` forever, entry un-acked
+forever, silently reclaimed-and-declined by every future sweep
+indefinitely) — that's the dead-letter queue's job to resolve.
 
 ## Design decisions worth preserving
 

@@ -31,7 +31,11 @@ export async function getJob(prisma: PrismaClient, id: string) {
 export async function markJobRunning(prisma: PrismaClient, id: string) {
   return prisma.job.update({
     where: { id },
-    data: { status: JobStatus.RUNNING, startedAt: new Date() },
+    // nextRetryAt is cleared here, not just left stale: once a handler is
+    // actually about to run (first attempt or a matured retry), any prior
+    // backoff deadline is no longer meaningful until/unless another
+    // failure sets a new one.
+    data: { status: JobStatus.RUNNING, startedAt: new Date(), nextRetryAt: null },
   });
 }
 
@@ -42,9 +46,19 @@ export async function markJobSucceeded(prisma: PrismaClient, id: string) {
   });
 }
 
-export async function markJobFailed(prisma: PrismaClient, id: string, error: string) {
+export async function markJobFailed(
+  prisma: PrismaClient,
+  id: string,
+  data: { error: string; attempts: number; nextRetryAt: Date | null },
+) {
   return prisma.job.update({
     where: { id },
-    data: { status: JobStatus.FAILED, error, finishedAt: new Date() },
+    data: {
+      status: JobStatus.FAILED,
+      error: data.error,
+      attempts: data.attempts,
+      nextRetryAt: data.nextRetryAt,
+      finishedAt: new Date(),
+    },
   });
 }

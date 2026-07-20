@@ -80,6 +80,11 @@ describe('processNextJob', () => {
     const row = await prisma.job.findUnique({ where: { id: job.id } });
     expect(row?.status).toBe('FAILED');
     expect(row?.error).toContain('no-such-handler');
+    // Milestone 7: first failure sets attempts=1 and schedules a future
+    // retry (well under the default maxAttempts=5, so not exhausted yet).
+    expect(row?.attempts).toBe(1);
+    expect(row?.nextRetryAt).not.toBeNull();
+    expect(row?.nextRetryAt?.getTime()).toBeGreaterThan(Date.now());
 
     // Left un-acked on purpose (Milestone 6 owns retry/crash recovery) —
     // still present in the PEL.
@@ -87,6 +92,74 @@ describe('processNextJob', () => {
 
     // Clean up the PEL entry ourselves since this milestone doesn't have
     // any mechanism yet that would otherwise ever ack it.
+    if (result) {
+      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+    }
+  });
+
+  it('defers a job whose nextRetryAt is still in the future, without touching its status', async () => {
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    createdJobIds.push(job.id);
+    // Simulate a job that already failed once and is mid-backoff.
+    const future = new Date(Date.now() + 60_000);
+    await prisma.job.update({
+      where: { id: job.id },
+      data: { status: 'FAILED', attempts: 1, nextRetryAt: future },
+    });
+    await enqueueJob(redis, job.id);
+
+    const result = await processNextJob(prisma, redis, logger, consumerName);
+
+    expect(result?.outcome).toBe('deferred');
+
+    // Declining to run the handler must not touch status/attempts at all.
+    const row = await prisma.job.findUnique({ where: { id: job.id } });
+    expect(row?.status).toBe('FAILED');
+    expect(row?.attempts).toBe(1);
+    expect(row?.nextRetryAt?.getTime()).toBe(future.getTime());
+
+    // Deferred entries are left un-acked too, same as a real failure —
+    // they'll be claimed (and declined) again until nextRetryAt passes.
+    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(true);
+
+    if (result) {
+      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+    }
+  });
+
+  it('stops scheduling retries once attempts reaches maxAttempts, and stays stopped on a later attempt', async () => {
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    createdJobIds.push(job.id);
+    // One failure away from the default maxAttempts=5.
+    await prisma.job.update({ where: { id: job.id }, data: { attempts: 4 } });
+    await enqueueJob(redis, job.id);
+
+    const result = await processNextJob(prisma, redis, logger, consumerName);
+
+    expect(result?.outcome).toBe('failed');
+
+    const row = await prisma.job.findUnique({ where: { id: job.id } });
+    expect(row?.status).toBe('FAILED');
+    expect(row?.attempts).toBe(5);
+    expect(row?.maxAttempts).toBe(5);
+    // Exhausted: no further retry is scheduled.
+    expect(row?.nextRetryAt).toBeNull();
+
+    // The exhausting failure alone isn't proof the job is *permanently*
+    // stopped — nextRetryAt being null could otherwise be misread by a
+    // later check as "no backoff, free to run now." The entry is still
+    // un-acked (in this consumer's own PEL) from the call above; simulate
+    // the next sweep reclaiming it and confirm it declines to re-run the
+    // handler at all: attempts must not climb past 5.
+    const reclaimed = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
+    expect(reclaimed).toHaveLength(1);
+    expect(reclaimed[0]?.outcome).toBe('deferred');
+
+    const rowAfter = await prisma.job.findUnique({ where: { id: job.id } });
+    expect(rowAfter?.attempts).toBe(5);
+
     if (result) {
       await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
       await redis.xdel(JOBS_STREAM_KEY, result.entryId);

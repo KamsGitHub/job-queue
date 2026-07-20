@@ -26,6 +26,16 @@ model Job {
   status  JobStatus @default(PENDING)
   error   String?
 
+  // Milestone 7: retry tracking. attempts increments on every failure;
+  // nextRetryAt is the exponential-backoff-with-jitter deadline before
+  // which processEntry() declines to re-run a failed job's handler, even
+  // if the Redis-side PEL sweep reclaims its stream entry before then.
+  // null once a job succeeds, or once attempts reaches maxAttempts and
+  // retries permanently stop.
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  nextRetryAt DateTime?
+
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
   startedAt  DateTime?
