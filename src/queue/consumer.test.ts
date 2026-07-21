@@ -2,7 +2,7 @@ import { createPrismaClient } from '../db/client';
 import { createRedisClient } from '../queue/redis';
 import { createLogger } from '../logger';
 import { createJob } from '../jobs/job.repository';
-import { enqueueJob, ensureConsumerGroup, JOBS_STREAM_KEY, CONSUMER_GROUP } from './stream';
+import { enqueueJob, ensureConsumerGroup, JOBS_STREAM_KEY, CONSUMER_GROUP, DEAD_LETTER_STREAM_KEY } from './stream';
 import { processNextJob, reclaimStaleEntries } from './consumer';
 
 // ioredis types XPENDING's extended-form return as `unknown[]`; at runtime
@@ -129,7 +129,7 @@ describe('processNextJob', () => {
     }
   });
 
-  it('stops scheduling retries once attempts reaches maxAttempts, and stays stopped on a later attempt', async () => {
+  it('moves a job to DEAD_LETTERED and acks its entry once attempts reaches maxAttempts, recording it on the dead-letter stream', async () => {
     const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
     createdJobIds.push(job.id);
     // One failure away from the default maxAttempts=5.
@@ -138,30 +138,65 @@ describe('processNextJob', () => {
 
     const result = await processNextJob(prisma, redis, logger, consumerName);
 
-    expect(result?.outcome).toBe('failed');
+    expect(result?.outcome).toBe('dead-lettered');
 
     const row = await prisma.job.findUnique({ where: { id: job.id } });
-    expect(row?.status).toBe('FAILED');
+    expect(row?.status).toBe('DEAD_LETTERED');
     expect(row?.attempts).toBe(5);
     expect(row?.maxAttempts).toBe(5);
-    // Exhausted: no further retry is scheduled.
     expect(row?.nextRetryAt).toBeNull();
 
-    // The exhausting failure alone isn't proof the job is *permanently*
-    // stopped — nextRetryAt being null could otherwise be misread by a
-    // later check as "no backoff, free to run now." The entry is still
-    // un-acked (in this consumer's own PEL) from the call above; simulate
-    // the next sweep reclaiming it and confirm it declines to re-run the
-    // handler at all: attempts must not climb past 5.
-    const reclaimed = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
-    expect(reclaimed).toHaveLength(1);
-    expect(reclaimed[0]?.outcome).toBe('deferred');
+    // Unlike a plain (retryable) failure, exhaustion acks the entry —
+    // it must never be reclaimed and reprocessed again.
+    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
 
-    const rowAfter = await prisma.job.findUnique({ where: { id: job.id } });
-    expect(rowAfter?.attempts).toBe(5);
+    // Recorded on the separate dead-letter stream, with enough context to
+    // inspect it without a Postgres round-trip.
+    const dlqEntries = await redis.xrange(DEAD_LETTER_STREAM_KEY, '-', '+');
+    const match = dlqEntries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === job.id);
+    expect(match).toBeDefined();
+    expect(match?.[1][match[1].indexOf('type') + 1]).toBe('no-such-handler');
+
+    if (match) {
+      await redis.xdel(DEAD_LETTER_STREAM_KEY, match[0]);
+    }
+    if (result) {
+      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+    }
+  });
+
+  it('is idempotent when reclaiming a stray already-DEAD_LETTERED job: acks without duplicating the dead-letter entry', async () => {
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    createdJobIds.push(job.id);
+    // Simulate a job already dead-lettered by a previous run, whose entry
+    // is somehow still un-acked (e.g. a stray left over from before this
+    // logic existed).
+    await prisma.job.update({
+      where: { id: job.id },
+      data: { status: 'DEAD_LETTERED', attempts: 5, nextRetryAt: null, error: 'already dead-lettered' },
+    });
+    await enqueueJob(redis, job.id);
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+
+    const results = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
+
+    expect(results).toHaveLength(1);
+    const [result] = results;
+    expect(result?.outcome).toBe('dead-lettered');
+
+    // Not re-written: attempts/error stay exactly what they already were.
+    const row = await prisma.job.findUnique({ where: { id: job.id } });
+    expect(row?.attempts).toBe(5);
+    expect(row?.error).toBe('already dead-lettered');
+
+    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+
+    // No duplicate dead-letter entry was created for this job.
+    const dlqEntries = await redis.xrange(DEAD_LETTER_STREAM_KEY, '-', '+');
+    const matches = dlqEntries.filter(([, fields]) => fields[fields.indexOf('jobId') + 1] === job.id);
+    expect(matches).toHaveLength(0);
 
     if (result) {
-      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
       await redis.xdel(JOBS_STREAM_KEY, result.entryId);
     }
   });

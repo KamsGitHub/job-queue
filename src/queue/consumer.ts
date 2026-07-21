@@ -1,16 +1,16 @@
 import type Redis from 'ioredis';
-import type { PrismaClient } from '../generated/prisma/client';
+import { JobStatus, type Job, type PrismaClient } from '../generated/prisma/client';
 import type { Logger } from '../logger';
 import { env } from '../config/env';
-import { JOBS_STREAM_KEY, CONSUMER_GROUP } from './stream';
-import { getJob, markJobRunning, markJobSucceeded, markJobFailed } from '../jobs/job.repository';
+import { JOBS_STREAM_KEY, CONSUMER_GROUP, sendToDeadLetter } from './stream';
+import { getJob, markJobRunning, markJobSucceeded, markJobFailed, markJobDeadLettered } from '../jobs/job.repository';
 import { getHandler } from '../jobs/handlers';
 import { computeBackoffMs } from './backoff';
 
 export interface ProcessedJob {
   entryId: string;
   jobId: string;
-  outcome: 'succeeded' | 'failed' | 'deferred';
+  outcome: 'succeeded' | 'failed' | 'deferred' | 'dead-lettered';
 }
 
 /**
@@ -42,6 +42,36 @@ function parseFirstEntry(response: unknown): { entryId: string; fields: string[]
 function extractField(fields: string[], name: string): string | undefined {
   const index = fields.indexOf(name);
   return index === -1 ? undefined : fields[index + 1];
+}
+
+/**
+ * Milestone 8: the permanent stop for a job that has exhausted its retry
+ * budget. Order matters — the dead-letter stream XADD happens before the
+ * Postgres update, so a failure here leaves Postgres untouched rather
+ * than risking a job marked DEAD_LETTERED that never actually reached the
+ * dead-letter stream; a later retry of this same transition would then
+ * just resend to the stream (a harmless duplicate entry, not a lost job).
+ * XACK happens last, only once both writes succeed — an entry must never
+ * be acked before its outcome is durably recorded somewhere.
+ *
+ * Guards against re-doing this if the job is already DEAD_LETTERED (the
+ * pre-check guard's catch-up path re-invokes this for stale un-acked
+ * entries from before this logic existed) — still acks either way, since
+ * the whole point is to stop the entry from being reclaimed forever.
+ */
+async function sendToDeadLetterAndAck(
+  prisma: PrismaClient,
+  redis: Redis,
+  entryId: string,
+  job: Pick<Job, 'id' | 'type' | 'status'>,
+  error: string,
+  attempts: number,
+): Promise<void> {
+  if (job.status !== JobStatus.DEAD_LETTERED) {
+    await sendToDeadLetter(redis, { jobId: job.id, type: job.type, error, attempts });
+    await markJobDeadLettered(prisma, job.id, { error, attempts });
+  }
+  await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, entryId);
 }
 
 /**
@@ -94,14 +124,17 @@ async function processEntry(
   // catch block), which would otherwise fall through this guard entirely
   // and let an exhausted job keep re-running its handler — and its
   // attempts counter keep climbing past maxAttempts — forever, on every
-  // future sweep. Exhaustion must be a permanent stop, not just "no
-  // backoff scheduled."
+  // future sweep. This is also the catch-up path for any stray un-acked
+  // entry left over from before Milestone 8 (already exhausted, but never
+  // moved to the dead-letter stream) — sendToDeadLetterAndAck's own
+  // idempotency check handles that without re-writing Postgres.
   if (job.attempts >= job.maxAttempts) {
     logger.error(
       { jobId, entryId, attempts: job.attempts, maxAttempts: job.maxAttempts },
-      'Job has exhausted its retry budget; leaving un-acked and giving up',
+      'Job has exhausted its retry budget; moving to dead letter',
     );
-    return { entryId, jobId, outcome: 'deferred' };
+    await sendToDeadLetterAndAck(prisma, redis, entryId, job, job.error ?? 'Exceeded max attempts', job.attempts);
+    return { entryId, jobId, outcome: 'dead-lettered' };
   }
 
   if (job.nextRetryAt && job.nextRetryAt.getTime() > Date.now()) {
@@ -129,13 +162,21 @@ async function processEntry(
     const message = err instanceof Error ? err.message : String(err);
     const attempts = job.attempts + 1;
     const exhausted = attempts >= job.maxAttempts;
-    const nextRetryAt = exhausted
-      ? null
-      : new Date(Date.now() + computeBackoffMs(attempts, env.WORKER_RETRY_BASE_MS, env.WORKER_RETRY_MAX_MS));
+
+    if (exhausted) {
+      logger.error(
+        { jobId, entryId, type: job.type, err, attempts, maxAttempts: job.maxAttempts },
+        'Job failed; max attempts exhausted, moving to dead letter',
+      );
+      await sendToDeadLetterAndAck(prisma, redis, entryId, job, message, attempts);
+      return { entryId, jobId, outcome: 'dead-lettered' };
+    }
+
+    const nextRetryAt = new Date(Date.now() + computeBackoffMs(attempts, env.WORKER_RETRY_BASE_MS, env.WORKER_RETRY_MAX_MS));
     await markJobFailed(prisma, jobId, { error: message, attempts, nextRetryAt });
     logger.error(
       { jobId, entryId, type: job.type, err, attempts, maxAttempts: job.maxAttempts, nextRetryAt },
-      exhausted ? 'Job failed; max attempts exhausted, giving up' : 'Job failed; will retry after backoff',
+      'Job failed; will retry after backoff',
     );
     return { entryId, jobId, outcome: 'failed' };
   }

@@ -24,8 +24,8 @@ OpenAPI/Swagger.
 4. Redis Streams as queue transport — done
 5. Worker process & consumer groups — done
 6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM) — done
-7. Retry logic & backoff (exponential + jitter) ← **currently here, see status below**
-8. Dead-letter queue
+7. Retry logic & backoff (exponential + jitter) — done
+8. Dead-letter queue ← **currently here, see status below**
 
 **Phase 2 — Correctness Under Concurrency**
 9. Idempotency & exactly-once effects
@@ -526,6 +526,83 @@ Not yet done, explicitly deferred to Milestone 8: what happens to a
 permanently-exhausted job (currently: `FAILED` forever, entry un-acked
 forever, silently reclaimed-and-declined by every future sweep
 indefinitely) — that's the dead-letter queue's job to resolve.
+
+## Status: Milestone 8 (Dead-Letter Queue)
+
+Three real decisions made before implementing:
+- **New `DEAD_LETTERED` status** (new migration), not reused `FAILED`.
+  Makes "permanently given up" directly queryable
+  (`WHERE status = 'DEAD_LETTERED'`) instead of requiring callers to know
+  to compare `attempts` against `maxAttempts` themselves.
+- **A separate Redis stream** (`jobs:dead-letter`), not Postgres-only.
+  This is the one place this project deliberately breaks its own
+  established "Postgres owns data, Redis is dispatch-only, never a second
+  copy that could drift" rule (explicit reasoning going back to M4) — and
+  it's safe to break here specifically because a dead-lettered job is
+  *final*: no requeue mechanism exists yet, so nothing will ever write to
+  that Postgres row again. There's no drift risk for data that never
+  changes again. The entry carries `jobId`, `type`, `error`, and
+  `attempts` — enough for operational tooling to `XRANGE`/`XREAD` it
+  directly without a Postgres round-trip.
+- **No manual requeue mechanism.** Scoped out — there's no job-management
+  API at all yet (`POST /jobs` only, per M3). Fits better once that
+  exists.
+
+Implemented:
+- `prisma/schema.prisma`: `JobStatus` gains `DEAD_LETTERED`.
+- `src/queue/stream.ts`: `DEAD_LETTER_STREAM_KEY` + `sendToDeadLetter()`.
+- `job.repository.ts`: `markJobDeadLettered(prisma, id, { error, attempts
+  })` — sets status, error, attempts, clears `nextRetryAt`, sets
+  `finishedAt`.
+- `consumer.ts`: new `sendToDeadLetterAndAck()` — the actual permanent
+  stop. **Operation order matters and is deliberate**: dead-letter stream
+  `XADD` happens *before* the Postgres update, so a failure there leaves
+  Postgres untouched rather than risking a job marked `DEAD_LETTERED`
+  that never actually reached the dead-letter stream (a later retry of
+  the same transition would just resend to the stream — a harmless
+  duplicate entry, not a lost job, the same asymmetric-risk reasoning
+  M4's compensating delete used). `XACK` of the *original* stream entry
+  happens last, only once both writes succeed.
+- Both places that used to just log-and-leave-un-acked on exhaustion now
+  call `sendToDeadLetterAndAck()` instead: the catch block's fresh
+  exhaustion (the moment `attempts` reaches `maxAttempts`) and the
+  pre-check guard (a defensive catch-up path for any stray already-
+  exhausted entry left over from before this logic existed, e.g. one
+  created under the old M7-only code). `sendToDeadLetterAndAck()` is
+  idempotent against being called on an already-`DEAD_LETTERED` job — it
+  skips re-writing Postgres and re-sending to the dead-letter stream, but
+  still acks, since the point is always to stop the entry being
+  reclaimed.
+- `ProcessedJob.outcome` gained a `'dead-lettered'` variant.
+- Tests (`consumer.test.ts`): replaced the old "stops scheduling retries"
+  test (which no longer matches — see below) with one verifying the
+  exhausting failure actually moves the job to `DEAD_LETTERED`, acks its
+  entry, and records it on the dead-letter stream with the right fields;
+  plus a new idempotency test simulating the stray-already-dead-lettered
+  catch-up path, verifying no duplicate dead-letter entry and no
+  Postgres rewrite.
+
+Gotcha from adapting an M7 test, not a new bug: the old exhaustion test
+asserted a *second* reclaim of an exhausted job would return `outcome:
+'deferred'` with the entry still pending — that was M7-era behavior.
+Under M8, the *first* exhausting call now acks the entry immediately, so
+there's nothing left to reclaim on a second sweep at all. Rewrote the
+test around the new behavior rather than patching the old assertions.
+
+Manually verified end-to-end: pre-set a job's `attempts` to 4 (one
+failure from the default `maxAttempts=5`) so exhaustion would happen on
+the very first real attempt rather than waiting through several sweep
+cycles, ran a real worker, and confirmed in one pass: `DEAD_LETTERED` in
+Postgres with `nextRetryAt: null`, empty `XPENDING` (fully acked), and
+the correct entry on `jobs:dead-letter` via `XRANGE`. Then watched **3+
+more sweep cycles (~15s) produce zero further log activity for that
+job** — direct confirmation the reclaim-and-decline churn flagged as a
+known cost back in M7 actually stops once a job is dead-lettered, not
+just in theory. Did not attempt a live repro of the idempotent-catch-up
+edge case specifically — it's already deterministically covered by the
+automated test, and reproducing it live would require stopping the
+worker mid-flight to avoid racing its real-time stream read, adding
+manual complexity without meaningfully more confidence.
 
 ## Design decisions worth preserving
 

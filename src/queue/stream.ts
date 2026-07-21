@@ -48,3 +48,37 @@ export async function enqueueJob(redis: Redis, jobId: string): Promise<string> {
   }
   return entryId;
 }
+
+/**
+ * Milestone 8: a separate append-only log for jobs that permanently
+ * exhausted their retry budget — operational visibility/tooling can XREAD
+ * this directly without a Postgres round-trip. Unlike jobs:stream, it's
+ * safe to carry more than just the job ID here: a dead-lettered job is
+ * final (no further Postgres writes will ever touch it in this
+ * milestone — there's no requeue mechanism yet), so there's no "two
+ * copies that could drift" risk the way there is for jobs:stream's still-
+ * mutating rows.
+ */
+export const DEAD_LETTER_STREAM_KEY = 'jobs:dead-letter';
+
+export async function sendToDeadLetter(
+  redis: Redis,
+  data: { jobId: string; type: string; error: string; attempts: number },
+): Promise<string> {
+  const entryId = await redis.xadd(
+    DEAD_LETTER_STREAM_KEY,
+    '*',
+    'jobId',
+    data.jobId,
+    'type',
+    data.type,
+    'error',
+    data.error,
+    'attempts',
+    String(data.attempts),
+  );
+  if (entryId === null) {
+    throw new Error('XADD to dead-letter stream returned null unexpectedly');
+  }
+  return entryId;
+}

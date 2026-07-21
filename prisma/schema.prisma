@@ -17,6 +17,11 @@ enum JobStatus {
   RUNNING
   SUCCEEDED
   FAILED
+  // Milestone 8: set once attempts reaches maxAttempts. Distinct from
+  // FAILED so "will retry soon" and "permanently given up" are directly
+  // queryable, instead of both being FAILED and requiring callers to know
+  // to compare attempts against maxAttempts themselves.
+  DEAD_LETTERED
 }
 
 model Job {

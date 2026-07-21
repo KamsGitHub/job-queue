@@ -62,3 +62,20 @@ export async function markJobFailed(
     },
   });
 }
+
+export async function markJobDeadLettered(
+  prisma: PrismaClient,
+  id: string,
+  data: { error: string; attempts: number },
+) {
+  return prisma.job.update({
+    where: { id },
+    data: {
+      status: JobStatus.DEAD_LETTERED,
+      error: data.error,
+      attempts: data.attempts,
+      nextRetryAt: null,
+      finishedAt: new Date(),
+    },
+  });
+}
