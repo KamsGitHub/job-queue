@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import type Redis from 'ioredis';
 import { PrismaClient } from '../generated/prisma/client';
 import { createJobSchema } from '../jobs/job.schema';
-import { createJob, deleteJob } from '../jobs/job.repository';
+import { findOrCreateJob, deleteJob } from '../jobs/job.repository';
 import { enqueueJob } from '../queue/stream';
 
 export async function jobRoutes(
@@ -11,7 +11,15 @@ export async function jobRoutes(
 ): Promise<void> {
   app.post('/jobs', async (req, reply) => {
     const body = createJobSchema.parse(req.body);
-    const job = await createJob(opts.prisma, body);
+    const { job, created } = await findOrCreateJob(opts.prisma, body);
+
+    // A repeat submission with the same idempotencyKey: the job is already
+    // persisted and was already enqueued the first time it was created, so
+    // re-enqueueing here would just duplicate the stream entry. 200, not
+    // 201 — nothing new was created by this request.
+    if (!created) {
+      return reply.code(200).send(job);
+    }
 
     try {
       await enqueueJob(opts.redis, job.id);

@@ -1,4 +1,4 @@
-import { PrismaClient, Prisma, JobStatus } from '../generated/prisma/client';
+import { PrismaClient, Prisma, JobStatus, type Job } from '../generated/prisma/client';
 import type { CreateJobInput } from './job.schema';
 
 /**
@@ -16,8 +16,56 @@ export async function createJob(prisma: PrismaClient, data: CreateJobInput) {
       // body, so it's guaranteed to be JSON-safe — this assertion just
       // bridges Zod's `unknown` to Prisma's own JSON input type.
       payload: data.payload as Prisma.InputJsonValue,
+      // exactOptionalPropertyTypes gotcha (see CLAUDE.md): `idempotencyKey:
+      // data.idempotencyKey` would set the key present-with-value-undefined
+      // when absent, which Prisma's optional field type rejects. Spread it
+      // in only when actually provided, so the key is truly absent instead.
+      ...(data.idempotencyKey ? { idempotencyKey: data.idempotencyKey } : {}),
     },
   });
+}
+
+export async function findJobByIdempotencyKey(prisma: PrismaClient, idempotencyKey: string) {
+  return prisma.job.findUnique({ where: { idempotencyKey } });
+}
+
+/**
+ * Milestone 9: the actual dedup logic for POST /jobs. If no key is given,
+ * behaves exactly like createJob. If a key is given, checks for an existing
+ * job with that key first — but a plain check-then-insert would still race
+ * under concurrent requests carrying the same key, so the insert's own
+ * unique-constraint violation (Prisma error P2002) is the real guard: two
+ * concurrent submissions can both pass the initial check, but only one
+ * insert wins, and the loser re-fetches and returns the winner's row
+ * instead of surfacing the constraint error to its caller.
+ */
+export async function findOrCreateJob(
+  prisma: PrismaClient,
+  data: CreateJobInput,
+): Promise<{ job: Job; created: boolean }> {
+  if (data.idempotencyKey) {
+    const existing = await findJobByIdempotencyKey(prisma, data.idempotencyKey);
+    if (existing) {
+      return { job: existing, created: false };
+    }
+  }
+
+  try {
+    const job = await createJob(prisma, data);
+    return { job, created: true };
+  } catch (err) {
+    if (
+      data.idempotencyKey &&
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002'
+    ) {
+      const existing = await findJobByIdempotencyKey(prisma, data.idempotencyKey);
+      if (existing) {
+        return { job: existing, created: false };
+      }
+    }
+    throw err;
+  }
 }
 
 export async function deleteJob(prisma: PrismaClient, id: string) {

@@ -25,10 +25,10 @@ OpenAPI/Swagger.
 5. Worker process & consumer groups — done
 6. Acknowledgment & crash recovery (XACK, PEL, XCLAIM) — done
 7. Retry logic & backoff (exponential + jitter) — done
-8. Dead-letter queue ← **currently here, see status below**
+8. Dead-letter queue — done
 
 **Phase 2 — Correctness Under Concurrency**
-9. Idempotency & exactly-once effects
+9. Idempotency & exactly-once effects ← **currently here, see status below**
 10. Priority queues
 11. Scheduled & delayed jobs
 
@@ -603,6 +603,78 @@ edge case specifically — it's already deterministically covered by the
 automated test, and reproducing it live would require stopping the
 worker mid-flight to avoid racing its real-time stream read, adding
 manual complexity without meaningfully more confidence.
+
+## Status: Milestone 9 (Idempotency & Exactly-Once Effects)
+
+Two independent gaps closed under one milestone, both flagged as reserved
+for M9 in earlier notes:
+
+- **Submission-side dedup.** `POST /jobs` accepts an optional
+  `idempotencyKey` in the body (`job.schema.ts`). New migration
+  (`prisma/migrations/20260721223047_add_idempotency_key/`) adds
+  `idempotencyKey String? @unique` to `Job` — reserved in the schema
+  since M2's notes. `job.repository.ts`'s new `findOrCreateJob()` is the
+  actual dedup logic: if a key is given and a job with that key already
+  exists, return it unchanged (`created: false`) instead of inserting a
+  duplicate. A plain check-then-insert would still race under concurrent
+  requests carrying the same key, so the real guard is the insert's own
+  unique-constraint violation (Prisma `P2002`) — the losing request
+  catches it and re-fetches the winner's row rather than surfacing the
+  constraint error. `routes/jobs.ts` returns `200` (not `201`) with the
+  *original* job on a repeat submission, and skips re-enqueueing — the
+  first submission already put it on the stream.
+- **Closes the exactly-once gap named explicitly back in Milestone 6**:
+  a crash between `markJobSucceeded` (Postgres) and `XACK` (Redis) left a
+  `SUCCEEDED` job's entry sitting in the PEL, where a later sweep would
+  reclaim and reprocess it — re-running the handler (and any real side
+  effect) a second time for work already completed. Fixed with one guard
+  at the top of `processEntry()` (`consumer.ts`): if the job's status is
+  already `SUCCEEDED` when an entry is delivered or reclaimed, skip the
+  handler entirely and just ack the stale redelivery.
+
+**Explicitly not solved, and named as a boundary rather than a gap to
+close**: the guard above only protects the window *after* Postgres
+already recorded success. If a crash happens *during* or immediately
+after handler execution but *before* `markJobSucceeded` commits, the job
+is still `PENDING`/`RUNNING` when reclaimed, and the handler genuinely
+runs again — a real duplicate side effect for handlers that call out to
+the world (e.g. an actual email send, a payment charge), not just a
+demo log line. This is the fundamental limit of at-least-once delivery:
+the queue can guarantee "never re-run a handler for a job it already
+knows succeeded," but it cannot make an arbitrary external side effect
+idempotent on the queue's behalf. Real handlers close this the standard
+way — using a stable per-job identity (e.g. `job.id`) as an idempotency
+key passed to whatever downstream system they call — but that's a
+property of the handler, not something to bolt onto the generic
+dispatch path for a single stand-in `send-email` handler that doesn't
+actually call anything. Recorded here as a deliberate non-goal rather
+than implemented speculatively.
+
+Tests: `routes/jobs.test.ts` adds a case submitting the same
+`idempotencyKey` twice with different payloads — asserts `201` then
+`200`, the same job ID both times, the *original* payload preserved (not
+the second request's), exactly one Postgres row, and exactly one stream
+entry (proving the second call didn't re-enqueue).
+`queue/consumer.test.ts` adds a case that pre-sets a job to `SUCCEEDED`,
+delivers its entry to a `dead-consumer` identity without acking (same
+stale-entry simulation pattern as the M6 tests), then reclaims it —
+asserts the outcome is `succeeded`, `startedAt` stays `null` (proving the
+handler didn't run again), and the entry is fully acked.
+
+Manually verified against live `npm run dev` + `npm run worker` + real
+Postgres/Redis, both gaps independently: (1) POST the same
+`idempotencyKey` twice with different payloads — first `201`, second
+`200` returning the *first* request's job/payload unchanged, confirmed
+in Postgres as a single row; (2) stopped the worker, submitted a job,
+manually stole its stream entry as a `dead-consumer` identity (raw
+`XREADGROUP`, never acked — same technique the test suite uses), forced
+the row to `SUCCEEDED` directly in Postgres (simulating the exact crash
+window this milestone closes), restarted the worker, and watched its
+very first sweep log `'Job already succeeded; skipping re-run and
+acking stale redelivery'` — confirmed zero additional `[send-email]
+would send` log lines for that job's payload (handler genuinely didn't
+re-run) and an empty `XPENDING` afterward (fully acked, won't be
+reclaimed again).
 
 ## Design decisions worth preserving
 

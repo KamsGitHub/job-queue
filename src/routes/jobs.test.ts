@@ -54,6 +54,48 @@ describe('POST /jobs', () => {
     await app.close();
   });
 
+  it('returns the existing job for a repeat submission with the same idempotencyKey, without enqueueing again', async () => {
+    const app = buildApp({ prisma, redis });
+    const idempotencyKey = `idem-${Date.now()}`;
+
+    const first = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'test@example.com' }, idempotencyKey },
+    });
+    expect(first.statusCode).toBe(201);
+    const firstBody = first.json();
+    createdJobIds.push(firstBody.id);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'ignored@example.com' }, idempotencyKey },
+    });
+
+    expect(second.statusCode).toBe(200);
+    const secondBody = second.json();
+    expect(secondBody.id).toBe(firstBody.id);
+    // Proves the second request's (different) payload was never persisted —
+    // the original row is returned untouched, not updated.
+    expect(secondBody.payload).toEqual({ to: 'test@example.com' });
+
+    // Only one row exists for this key.
+    const rows = await prisma.job.findMany({ where: { idempotencyKey } });
+    expect(rows).toHaveLength(1);
+
+    // Only one stream entry was ever produced — the second request must
+    // not have enqueued a duplicate.
+    const entries = await redis.xrevrange(JOBS_STREAM_KEY, '+', '-', 'COUNT', 20);
+    const matches = entries.filter(([, fields]) => fields[fields.indexOf('jobId') + 1] === firstBody.id);
+    expect(matches).toHaveLength(1);
+    if (matches[0]) {
+      await redis.xdel(JOBS_STREAM_KEY, matches[0][0]);
+    }
+
+    await app.close();
+  });
+
   it('rejects a request missing "type"', async () => {
     const app = buildApp({ prisma, redis });
 

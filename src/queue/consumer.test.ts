@@ -201,6 +201,36 @@ describe('processNextJob', () => {
     }
   });
 
+  it('is idempotent when reclaiming a stale entry for a job already SUCCEEDED: acks without re-running the handler', async () => {
+    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'already-done@example.com' } });
+    createdJobIds.push(job.id);
+    // Simulate the Milestone 6-named gap directly: the handler already ran
+    // and Postgres already recorded success, but the entry is still
+    // sitting un-acked (as if the process crashed between markJobSucceeded
+    // and XACK).
+    await prisma.job.update({ where: { id: job.id }, data: { status: 'SUCCEEDED', finishedAt: new Date() } });
+    await enqueueJob(redis, job.id);
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+
+    const results = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
+
+    expect(results).toHaveLength(1);
+    const [result] = results;
+    expect(result?.outcome).toBe('succeeded');
+
+    // Untouched — no second run recorded a new finishedAt/startedAt.
+    const row = await prisma.job.findUnique({ where: { id: job.id } });
+    expect(row?.status).toBe('SUCCEEDED');
+    expect(row?.startedAt).toBeNull();
+
+    // Acked, so it will never be reclaimed and reprocessed again.
+    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+
+    if (result) {
+      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+    }
+  });
+
   it('reclaimStaleEntries claims an entry abandoned by a dead consumer and reprocesses it: succeeds and acks', async () => {
     const job = await createJob(prisma, { type: 'send-email', payload: { to: 'stale@example.com' } });
     createdJobIds.push(job.id);

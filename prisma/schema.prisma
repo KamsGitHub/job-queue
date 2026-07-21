@@ -31,6 +31,12 @@ model Job {
   status  JobStatus @default(PENDING)
   error   String?
 
+  // Milestone 9: optional client-supplied dedup key for POST /jobs. Unique
+  // so a repeat submission with the same key can be detected via a DB
+  // constraint violation (safe under concurrent requests) rather than a
+  // check-then-insert race. Reserved for this since Milestone 2.
+  idempotencyKey String? @unique
+
   // Milestone 7: retry tracking. attempts increments on every failure;
   // nextRetryAt is the exponential-backoff-with-jitter deadline before
   // which processEntry() declines to re-run a failed job's handler, even

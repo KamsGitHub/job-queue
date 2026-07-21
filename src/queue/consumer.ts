@@ -119,6 +119,19 @@ async function processEntry(
     return { entryId, jobId, outcome: 'failed' };
   }
 
+  // Milestone 9: closes the gap named back in Milestone 6 — a crash
+  // between markJobSucceeded (Postgres) and XACK (Redis) leaves a
+  // SUCCEEDED job's entry sitting in the PEL, where a later sweep would
+  // otherwise reclaim and reprocess it, re-running the handler (and any
+  // real side effect it has) a second time for work that already
+  // completed. Checked before any other guard, since none of them apply
+  // once a job is already done — just ack the stale redelivery and stop.
+  if (job.status === JobStatus.SUCCEEDED) {
+    logger.info({ jobId, entryId }, 'Job already succeeded; skipping re-run and acking stale redelivery');
+    await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, entryId);
+    return { entryId, jobId, outcome: 'succeeded' };
+  }
+
   // Checked separately from (and before) the backoff-window check below:
   // once attempts reaches maxAttempts, nextRetryAt is set to null (see the
   // catch block), which would otherwise fall through this guard entirely
