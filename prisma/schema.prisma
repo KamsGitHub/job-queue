@@ -24,6 +24,16 @@ enum JobStatus {
   DEAD_LETTERED
 }
 
+// Milestone 10: three tiers, not an arbitrary int. Dispatch order is
+// implemented as one dedicated Redis Stream per tier (see queue/stream.ts),
+// so the tier set has to stay small and fixed — one stream per possible
+// value doesn't scale to an unbounded integer priority.
+enum JobPriority {
+  LOW
+  NORMAL
+  HIGH
+}
+
 model Job {
   id      String    @id @default(uuid())
   type    String
@@ -36,6 +46,13 @@ model Job {
   // constraint violation (safe under concurrent requests) rather than a
   // check-then-insert race. Reserved for this since Milestone 2.
   idempotencyKey String? @unique
+
+  // Milestone 10: which of the three per-tier Redis Streams this job was
+  // dispatched onto. Stored on the row mainly for observability/queryability
+  // (e.g. "how many HIGH jobs are pending") — the worker never queries
+  // Postgres by priority to decide dispatch order, the stream it was
+  // enqueued onto already encodes that.
+  priority JobPriority @default(NORMAL)
 
   // Milestone 7: retry tracking. attempts increments on every failure;
   // nextRetryAt is the exponential-backoff-with-jitter deadline before

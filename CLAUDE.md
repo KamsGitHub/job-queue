@@ -28,8 +28,8 @@ OpenAPI/Swagger.
 8. Dead-letter queue — done
 
 **Phase 2 — Correctness Under Concurrency**
-9. Idempotency & exactly-once effects ← **currently here, see status below**
-10. Priority queues
+9. Idempotency & exactly-once effects — done
+10. Priority queues ← **currently here, see status below**
 11. Scheduled & delayed jobs
 
 **Phase 3 — Making It a Real Service**
@@ -675,6 +675,106 @@ acking stale redelivery'` — confirmed zero additional `[send-email]
 would send` log lines for that job's payload (handler genuinely didn't
 re-run) and an empty `XPENDING` afterward (fully acked, won't be
 reclaimed again).
+
+## Status: Milestone 10 (Priority Queues)
+
+Key architectural decision made before implementing: Redis Streams only
+ever deliver in append order — there is no way to reorder entries already
+sitting on a single stream by priority. Two designs were considered:
+
+- Rejected: abandon streams for dispatch ordering in favor of a Redis
+  sorted set (score = priority) that workers poll instead. This would
+  have meant rebuilding ack/PEL/crash-recovery/retry/dead-letter — the
+  entire mechanism built up across Milestones 5-9 — from scratch, since
+  none of that machinery exists for a plain ZSET.
+- **Chosen: one dedicated Redis Stream per priority tier**
+  (`jobs:stream:high` / `:normal` / `:low`, `queue/stream.ts`), same
+  consumer group name (`workers`) on each. Every mechanism from
+  Milestones 5-9 — XACK, XAUTOCLAIM stale-entry reclaim, retry backoff,
+  dead-letter — applies completely unchanged *per tier*, since each
+  stream keeps its own independent PEL. Only the dispatch loop needed to
+  become priority-aware: which stream to read from next.
+
+Implemented:
+- New migration (`prisma/migrations/..._add_job_priority/`): `JobPriority`
+  enum (`LOW`/`NORMAL`/`HIGH`) and `Job.priority @default(NORMAL)`. Three
+  fixed tiers, not an arbitrary integer — a stream-per-tier design doesn't
+  scale to unbounded priority values, so the tier set has to stay small
+  and fixed.
+- `job.schema.ts`: `priority` accepted on `POST /jobs`, defaulted via
+  Zod's `.default('NORMAL')` (not left optional) so it's always a
+  concrete value by the time it reaches the repository/enqueue layer —
+  avoids the `exactOptionalPropertyTypes` dance idempotencyKey needed in
+  M9, since this field is never genuinely absent past validation.
+- `queue/stream.ts`: `JOBS_STREAM_KEYS: Record<JobPriority, string>` and
+  `JOB_PRIORITY_ORDER` (highest to lowest — `[HIGH, NORMAL, LOW]`).
+  `ensureConsumerGroups()` creates the group on all three.
+  `enqueueJob(redis, jobId, priority)` now requires a priority, choosing
+  the stream to `XADD` onto.
+- `consumer.ts`'s `processNextJob()`: checks `JOB_PRIORITY_ORDER`'s
+  streams in order, **non-blocking** on every tier except the last —
+  the instant a HIGH job exists it's found and returned without ever
+  touching NORMAL/LOW; only the final (lowest) tier's read carries
+  `BLOCK blockMs`, which is what keeps the worker from busy-looping when
+  everything is empty. Tradeoff, named explicitly: if the worker is
+  mid-block on the lowest tier when a HIGH job is submitted, it isn't
+  noticed until that block resolves — bounded by `blockMs` (default 5s),
+  not unbounded, same class of bounded-latency tradeoff as this
+  project's graceful-shutdown design.
+- **Explicitly out of scope**: no anti-starvation scheme. This is
+  *strict* priority — a sustained flood of HIGH jobs can delay LOW ones
+  indefinitely, since HIGH is always checked and drained first. No
+  weighted round-robin or aging mechanism exists to bound that. Named as
+  this milestone's scope boundary rather than solved speculatively for a
+  problem nobody has hit yet.
+- `processEntry()`, `sendToDeadLetterAndAck()`, and
+  `reclaimStaleEntries()` all now take/thread through the specific
+  `streamKey` a given entry came from (for `XACK`/`XAUTOCLAIM`) — the
+  M6-M9 logic inside them is otherwise completely unchanged.
+  `reclaimStaleEntries()` sweeps all three streams every call, high to
+  low, rather than needing a separate sweep timer per tier.
+- `worker.ts`: `ensureConsumerGroup` → `ensureConsumerGroups`; log
+  message updated to name all three streams.
+
+Tests: `consumer.test.ts` adds a case that enqueues a `NORMAL` job then a
+`HIGH` job (in that order) and asserts `processNextJob` returns the HIGH
+one first, then the NORMAL one next — proving priority, not insertion
+order, governs dispatch. `jobs.test.ts` adds a case asserting `POST
+/jobs` defaults to `NORMAL` when omitted and, given an explicit
+`priority: 'HIGH'`, both stamps the Postgres row and actually enqueues
+onto `jobs:stream:high` specifically (not just trusts the DB column).
+
+Manually verified against live `npm run dev` + `npm run worker` + real
+Postgres/Redis: stopped the worker, submitted a `LOW` job followed by a
+`HIGH` job (so both sat unclaimed, ruling out a race), restarted the
+worker, and confirmed via its log that the `HIGH` job (`high-retry@...`,
+submitted *second*) was processed and succeeded *before* the `LOW` job
+(`low-retry@...`, submitted *first*) — strict priority dispatch working
+end-to-end, not just in the test suite.
+
+Also hit, and worth recording since it's the second time: killing only
+`tsx watch`'s wrapper processes (the `sh -c` shell and the `tsx watch`
+supervisor node process) leaves the actual watched child process
+(`src/server.ts`/`src/worker.ts`) running, orphaned and reparented to
+`init` — it keeps hot-reloading and serving/consuming traffic
+completely normally, invisible unless you specifically check for it. Bit
+the M9 manual verification once already (stale server on port 3000) and
+bit this milestone's live priority test too (a leftover orphaned worker
+raced the freshly-started one and consumed both test jobs before dispatch
+order could be observed). Fix each time: `pkill -f "src/server.ts"` /
+`pkill -f "src/worker.ts"` (matches the actual child, not just the
+wrapper layer) rather than killing individually-inspected PIDs from a
+`ps aux` snapshot.
+
+Related, and worth remembering going forward: `consumer.test.ts` runs
+against the *real* dev Postgres/Redis (this project's stated no-mocks
+policy), which means a live `npm run worker` left running in the
+background is a genuine competing consumer in the exact same `workers`
+group the test suite uses — it will race the test for freshly-enqueued
+entries and cause spurious, non-deterministic failures that look like
+product bugs but are purely test-environment contamination. Always stop
+any locally-running `npm run dev`/`npm run worker` before trusting an
+`npm test` result, and restart them afterward for manual use.
 
 ## Design decisions worth preserving
 

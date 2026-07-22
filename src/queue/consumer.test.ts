@@ -2,7 +2,7 @@ import { createPrismaClient } from '../db/client';
 import { createRedisClient } from '../queue/redis';
 import { createLogger } from '../logger';
 import { createJob } from '../jobs/job.repository';
-import { enqueueJob, ensureConsumerGroup, JOBS_STREAM_KEY, CONSUMER_GROUP, DEAD_LETTER_STREAM_KEY } from './stream';
+import { enqueueJob, ensureConsumerGroups, JOBS_STREAM_KEYS, CONSUMER_GROUP, DEAD_LETTER_STREAM_KEY } from './stream';
 import { processNextJob, reclaimStaleEntries } from './consumer';
 
 // ioredis types XPENDING's extended-form return as `unknown[]`; at runtime
@@ -11,9 +11,10 @@ type PendingEntry = [id: string, consumer: string, idleTimeMs: number, deliveryC
 
 async function isStillPending(
   redis: ReturnType<typeof createRedisClient>,
+  streamKey: string,
   entryId: string,
 ): Promise<boolean> {
-  const pending = (await redis.xpending(JOBS_STREAM_KEY, CONSUMER_GROUP, '-', '+', 10)) as PendingEntry[];
+  const pending = (await redis.xpending(streamKey, CONSUMER_GROUP, '-', '+', 10)) as PendingEntry[];
   return pending.some(([id]) => id === entryId);
 }
 
@@ -31,8 +32,11 @@ describe('processNextJob', () => {
     // entry read is the one this test just enqueued" without racing
     // whatever else happens to be sitting on the stream. Deleting the
     // stream key also destroys its consumer group, so recreate it after.
-    await redis.del(JOBS_STREAM_KEY);
-    await ensureConsumerGroup(redis);
+    // Milestone 10: three streams now, one per priority tier.
+    for (const streamKey of Object.values(JOBS_STREAM_KEYS)) {
+      await redis.del(streamKey);
+    }
+    await ensureConsumerGroups(redis);
   });
 
   afterAll(async () => {
@@ -44,9 +48,9 @@ describe('processNextJob', () => {
   });
 
   it('processes a job with a registered handler: marks it SUCCEEDED and acks the stream entry', async () => {
-    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'test@example.com' } });
+    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'test@example.com' }, priority: 'NORMAL' });
     createdJobIds.push(job.id);
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
     const result = await processNextJob(prisma, redis, logger, consumerName);
 
@@ -59,17 +63,17 @@ describe('processNextJob', () => {
     expect(row?.finishedAt).not.toBeNull();
 
     // Acked entries leave the consumer's Pending Entries List entirely.
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(false);
 
     if (result) {
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('processes a job with no registered handler: marks it FAILED and leaves it un-acked', async () => {
-    const job = await createJob(prisma, { type: 'no-such-handler', payload: { foo: 'bar' } });
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: { foo: 'bar' }, priority: 'NORMAL' });
     createdJobIds.push(job.id);
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
     const result = await processNextJob(prisma, redis, logger, consumerName);
 
@@ -88,18 +92,18 @@ describe('processNextJob', () => {
 
     // Left un-acked on purpose (Milestone 6 owns retry/crash recovery) —
     // still present in the PEL.
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(true);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(true);
 
     // Clean up the PEL entry ourselves since this milestone doesn't have
     // any mechanism yet that would otherwise ever ack it.
     if (result) {
-      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xack(JOBS_STREAM_KEYS.NORMAL, CONSUMER_GROUP, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('defers a job whose nextRetryAt is still in the future, without touching its status', async () => {
-    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {}, priority: 'NORMAL' });
     createdJobIds.push(job.id);
     // Simulate a job that already failed once and is mid-backoff.
     const future = new Date(Date.now() + 60_000);
@@ -107,7 +111,7 @@ describe('processNextJob', () => {
       where: { id: job.id },
       data: { status: 'FAILED', attempts: 1, nextRetryAt: future },
     });
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
     const result = await processNextJob(prisma, redis, logger, consumerName);
 
@@ -121,20 +125,20 @@ describe('processNextJob', () => {
 
     // Deferred entries are left un-acked too, same as a real failure —
     // they'll be claimed (and declined) again until nextRetryAt passes.
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(true);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(true);
 
     if (result) {
-      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xack(JOBS_STREAM_KEYS.NORMAL, CONSUMER_GROUP, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('moves a job to DEAD_LETTERED and acks its entry once attempts reaches maxAttempts, recording it on the dead-letter stream', async () => {
-    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {}, priority: 'NORMAL' });
     createdJobIds.push(job.id);
     // One failure away from the default maxAttempts=5.
     await prisma.job.update({ where: { id: job.id }, data: { attempts: 4 } });
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
     const result = await processNextJob(prisma, redis, logger, consumerName);
 
@@ -148,7 +152,7 @@ describe('processNextJob', () => {
 
     // Unlike a plain (retryable) failure, exhaustion acks the entry —
     // it must never be reclaimed and reprocessed again.
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(false);
 
     // Recorded on the separate dead-letter stream, with enough context to
     // inspect it without a Postgres round-trip.
@@ -161,12 +165,12 @@ describe('processNextJob', () => {
       await redis.xdel(DEAD_LETTER_STREAM_KEY, match[0]);
     }
     if (result) {
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('is idempotent when reclaiming a stray already-DEAD_LETTERED job: acks without duplicating the dead-letter entry', async () => {
-    const job = await createJob(prisma, { type: 'no-such-handler', payload: {} });
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: {}, priority: 'NORMAL' });
     createdJobIds.push(job.id);
     // Simulate a job already dead-lettered by a previous run, whose entry
     // is somehow still un-acked (e.g. a stray left over from before this
@@ -175,8 +179,8 @@ describe('processNextJob', () => {
       where: { id: job.id },
       data: { status: 'DEAD_LETTERED', attempts: 5, nextRetryAt: null, error: 'already dead-lettered' },
     });
-    await enqueueJob(redis, job.id);
-    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+    await enqueueJob(redis, job.id, 'NORMAL');
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEYS.NORMAL, '>');
 
     const results = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
 
@@ -189,7 +193,7 @@ describe('processNextJob', () => {
     expect(row?.attempts).toBe(5);
     expect(row?.error).toBe('already dead-lettered');
 
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(false);
 
     // No duplicate dead-letter entry was created for this job.
     const dlqEntries = await redis.xrange(DEAD_LETTER_STREAM_KEY, '-', '+');
@@ -197,20 +201,24 @@ describe('processNextJob', () => {
     expect(matches).toHaveLength(0);
 
     if (result) {
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('is idempotent when reclaiming a stale entry for a job already SUCCEEDED: acks without re-running the handler', async () => {
-    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'already-done@example.com' } });
+    const job = await createJob(prisma, {
+      type: 'send-email',
+      payload: { to: 'already-done@example.com' },
+      priority: 'NORMAL',
+    });
     createdJobIds.push(job.id);
     // Simulate the Milestone 6-named gap directly: the handler already ran
     // and Postgres already recorded success, but the entry is still
     // sitting un-acked (as if the process crashed between markJobSucceeded
     // and XACK).
     await prisma.job.update({ where: { id: job.id }, data: { status: 'SUCCEEDED', finishedAt: new Date() } });
-    await enqueueJob(redis, job.id);
-    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+    await enqueueJob(redis, job.id, 'NORMAL');
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEYS.NORMAL, '>');
 
     const results = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
 
@@ -224,22 +232,22 @@ describe('processNextJob', () => {
     expect(row?.startedAt).toBeNull();
 
     // Acked, so it will never be reclaimed and reprocessed again.
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(false);
 
     if (result) {
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('reclaimStaleEntries claims an entry abandoned by a dead consumer and reprocesses it: succeeds and acks', async () => {
-    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'stale@example.com' } });
+    const job = await createJob(prisma, { type: 'send-email', payload: { to: 'stale@example.com' }, priority: 'NORMAL' });
     createdJobIds.push(job.id);
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
     // Simulate a consumer that read the entry (so it's in the group's PEL,
     // owned by that consumer) then crashed before processing or acking it —
     // never call processEntry for it under this identity.
-    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEYS.NORMAL, '>');
 
     // idleMs=0: claim immediately regardless of real elapsed time, so the
     // test doesn't need to sleep past a real staleness threshold.
@@ -253,19 +261,19 @@ describe('processNextJob', () => {
     const row = await prisma.job.findUnique({ where: { id: job.id } });
     expect(row?.status).toBe('SUCCEEDED');
 
-    expect(await isStillPending(redis, result?.entryId ?? '')).toBe(false);
+    expect(await isStillPending(redis, JOBS_STREAM_KEYS.NORMAL, result?.entryId ?? '')).toBe(false);
 
     if (result) {
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
     }
   });
 
   it('reclaimStaleEntries claims a stale entry, reprocesses it, and transfers PEL ownership on failure', async () => {
-    const job = await createJob(prisma, { type: 'no-such-handler', payload: { foo: 'bar' } });
+    const job = await createJob(prisma, { type: 'no-such-handler', payload: { foo: 'bar' }, priority: 'NORMAL' });
     createdJobIds.push(job.id);
-    await enqueueJob(redis, job.id);
+    await enqueueJob(redis, job.id, 'NORMAL');
 
-    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEY, '>');
+    await redis.xreadgroup('GROUP', CONSUMER_GROUP, 'dead-consumer', 'COUNT', 1, 'STREAMS', JOBS_STREAM_KEYS.NORMAL, '>');
 
     const results = await reclaimStaleEntries(prisma, redis, logger, consumerName, 0);
 
@@ -280,13 +288,39 @@ describe('processNextJob', () => {
     // Still un-acked, but ownership moved from 'dead-consumer' to this
     // worker's own consumerName — proves XAUTOCLAIM actually reassigned it,
     // not just left it where it was.
-    const pending = (await redis.xpending(JOBS_STREAM_KEY, CONSUMER_GROUP, '-', '+', 10)) as PendingEntry[];
+    const pending = (await redis.xpending(JOBS_STREAM_KEYS.NORMAL, CONSUMER_GROUP, '-', '+', 10)) as PendingEntry[];
     const owner = pending.find(([id]) => id === result?.entryId)?.[1];
     expect(owner).toBe(consumerName);
 
     if (result) {
-      await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, result.entryId);
-      await redis.xdel(JOBS_STREAM_KEY, result.entryId);
+      await redis.xack(JOBS_STREAM_KEYS.NORMAL, CONSUMER_GROUP, result.entryId);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, result.entryId);
+    }
+  });
+
+  it('Milestone 10: dispatches a HIGH-priority job before an earlier-enqueued NORMAL one', async () => {
+    const normalJob = await createJob(prisma, { type: 'send-email', payload: { to: 'normal@example.com' }, priority: 'NORMAL' });
+    const highJob = await createJob(prisma, { type: 'send-email', payload: { to: 'high@example.com' }, priority: 'HIGH' });
+    createdJobIds.push(normalJob.id, highJob.id);
+
+    // Enqueue NORMAL first — if dispatch were plain insertion-order/FIFO,
+    // this would be the one processNextJob returns first.
+    await enqueueJob(redis, normalJob.id, 'NORMAL');
+    await enqueueJob(redis, highJob.id, 'HIGH');
+
+    const first = await processNextJob(prisma, redis, logger, consumerName);
+    expect(first?.jobId).toBe(highJob.id);
+    expect(first?.outcome).toBe('succeeded');
+    if (first) {
+      await redis.xdel(JOBS_STREAM_KEYS.HIGH, first.entryId);
+    }
+
+    // With the HIGH stream now empty, the previously-queued NORMAL job is
+    // next.
+    const second = await processNextJob(prisma, redis, logger, consumerName);
+    expect(second?.jobId).toBe(normalJob.id);
+    if (second) {
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, second.entryId);
     }
   });
 });

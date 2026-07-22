@@ -1,7 +1,7 @@
 import os from 'node:os';
 import { createPrismaClient } from './db/client';
 import { createRedisClient } from './queue/redis';
-import { ensureConsumerGroup } from './queue/stream';
+import { ensureConsumerGroups } from './queue/stream';
 import { processNextJob, reclaimStaleEntries } from './queue/consumer';
 import { createLogger } from './logger';
 import { env } from './config/env';
@@ -57,11 +57,11 @@ function startStaleEntrySweep(): NodeJS.Timeout {
 }
 
 async function loop(): Promise<void> {
-  await ensureConsumerGroup(redis);
+  await ensureConsumerGroups(redis);
   const sweepTimer = startStaleEntrySweep();
   logger.info(
     { consumerName, sweepIntervalMs: env.WORKER_STALE_SWEEP_INTERVAL_MS, idleMs: env.WORKER_STALE_IDLE_MS },
-    'Worker started, listening on jobs:stream',
+    'Worker started, listening on jobs:stream:high / :normal / :low',
   );
 
   while (running) {

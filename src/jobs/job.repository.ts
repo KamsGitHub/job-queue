@@ -16,6 +16,7 @@ export async function createJob(prisma: PrismaClient, data: CreateJobInput) {
       // body, so it's guaranteed to be JSON-safe — this assertion just
       // bridges Zod's `unknown` to Prisma's own JSON input type.
       payload: data.payload as Prisma.InputJsonValue,
+      priority: data.priority,
       // exactOptionalPropertyTypes gotcha (see CLAUDE.md): `idempotencyKey:
       // data.idempotencyKey` would set the key present-with-value-undefined
       // when absent, which Prisma's optional field type rejects. Spread it

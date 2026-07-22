@@ -22,7 +22,7 @@ export async function jobRoutes(
     }
 
     try {
-      await enqueueJob(opts.redis, job.id);
+      await enqueueJob(opts.redis, job.id, job.priority);
     } catch (err) {
       // The Postgres row and the Redis stream aren't written atomically —
       // if the stream write fails, a PENDING row with nothing to ever

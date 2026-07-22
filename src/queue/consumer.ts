@@ -2,7 +2,7 @@ import type Redis from 'ioredis';
 import { JobStatus, type Job, type PrismaClient } from '../generated/prisma/client';
 import type { Logger } from '../logger';
 import { env } from '../config/env';
-import { JOBS_STREAM_KEY, CONSUMER_GROUP, sendToDeadLetter } from './stream';
+import { JOBS_STREAM_KEYS, JOB_PRIORITY_ORDER, CONSUMER_GROUP, sendToDeadLetter } from './stream';
 import { getJob, markJobRunning, markJobSucceeded, markJobFailed, markJobDeadLettered } from '../jobs/job.repository';
 import { getHandler } from '../jobs/handlers';
 import { computeBackoffMs } from './backoff';
@@ -62,6 +62,7 @@ function extractField(fields: string[], name: string): string | undefined {
 async function sendToDeadLetterAndAck(
   prisma: PrismaClient,
   redis: Redis,
+  streamKey: string,
   entryId: string,
   job: Pick<Job, 'id' | 'type' | 'status'>,
   error: string,
@@ -71,7 +72,7 @@ async function sendToDeadLetterAndAck(
     await sendToDeadLetter(redis, { jobId: job.id, type: job.type, error, attempts });
     await markJobDeadLettered(prisma, job.id, { error, attempts });
   }
-  await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, entryId);
+  await redis.xack(streamKey, CONSUMER_GROUP, entryId);
 }
 
 /**
@@ -104,6 +105,7 @@ async function processEntry(
   prisma: PrismaClient,
   redis: Redis,
   logger: Logger,
+  streamKey: string,
   entryId: string,
   fields: string[],
 ): Promise<ProcessedJob> {
@@ -128,7 +130,7 @@ async function processEntry(
   // once a job is already done — just ack the stale redelivery and stop.
   if (job.status === JobStatus.SUCCEEDED) {
     logger.info({ jobId, entryId }, 'Job already succeeded; skipping re-run and acking stale redelivery');
-    await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, entryId);
+    await redis.xack(streamKey, CONSUMER_GROUP, entryId);
     return { entryId, jobId, outcome: 'succeeded' };
   }
 
@@ -146,7 +148,7 @@ async function processEntry(
       { jobId, entryId, attempts: job.attempts, maxAttempts: job.maxAttempts },
       'Job has exhausted its retry budget; moving to dead letter',
     );
-    await sendToDeadLetterAndAck(prisma, redis, entryId, job, job.error ?? 'Exceeded max attempts', job.attempts);
+    await sendToDeadLetterAndAck(prisma, redis, streamKey, entryId, job, job.error ?? 'Exceeded max attempts', job.attempts);
     return { entryId, jobId, outcome: 'dead-lettered' };
   }
 
@@ -168,7 +170,7 @@ async function processEntry(
     // writing it in job.repository.ts's createJob().
     await handler(job.payload as Record<string, unknown>, { logger });
     await markJobSucceeded(prisma, jobId);
-    await redis.xack(JOBS_STREAM_KEY, CONSUMER_GROUP, entryId);
+    await redis.xack(streamKey, CONSUMER_GROUP, entryId);
     logger.info({ jobId, entryId, type: job.type }, 'Job succeeded');
     return { entryId, jobId, outcome: 'succeeded' };
   } catch (err) {
@@ -181,7 +183,7 @@ async function processEntry(
         { jobId, entryId, type: job.type, err, attempts, maxAttempts: job.maxAttempts },
         'Job failed; max attempts exhausted, moving to dead letter',
       );
-      await sendToDeadLetterAndAck(prisma, redis, entryId, job, message, attempts);
+      await sendToDeadLetterAndAck(prisma, redis, streamKey, entryId, job, message, attempts);
       return { entryId, jobId, outcome: 'dead-lettered' };
     }
 
@@ -196,9 +198,20 @@ async function processEntry(
 }
 
 /**
- * Reads and processes (at most) one job from the stream, as a single
- * consumer in CONSUMER_GROUP. Returns null if BLOCK timed out with nothing
- * new to read.
+ * Reads and processes (at most) one job, as a single consumer in
+ * CONSUMER_GROUP. Returns null if nothing new was found on any tier.
+ *
+ * Milestone 10: strict priority across the three per-tier streams —
+ * JOB_PRIORITY_ORDER's streams are checked highest to lowest, each with a
+ * non-blocking XREADGROUP (a read with no BLOCK option returns immediately,
+ * empty or not), so a HIGH-priority job present right now is always found
+ * and processed before ever looking at NORMAL/LOW. Only the *last* stream
+ * in the order blocks (for blockMs) — that's what keeps the worker from
+ * busy-looping when everything is empty, while still processing anything
+ * on a higher tier the instant it exists rather than waiting out someone
+ * else's BLOCK. Tradeoff: if the worker is mid-block on the lowest tier
+ * when a HIGH job is submitted, it won't be noticed until that block
+ * resolves — bounded by blockMs, not unbounded.
  */
 export async function processNextJob(
   prisma: PrismaClient,
@@ -207,24 +220,28 @@ export async function processNextJob(
   consumerName: string,
   blockMs = 5000,
 ): Promise<ProcessedJob | null> {
-  const response = await redis.xreadgroup(
-    'GROUP',
-    CONSUMER_GROUP,
-    consumerName,
-    'COUNT',
-    1,
-    'BLOCK',
-    blockMs,
-    'STREAMS',
-    JOBS_STREAM_KEY,
-    '>',
-  );
+  for (let i = 0; i < JOB_PRIORITY_ORDER.length; i++) {
+    const priority = JOB_PRIORITY_ORDER[i];
+    if (!priority) {
+      continue;
+    }
+    const streamKey = JOBS_STREAM_KEYS[priority];
+    const isLastTier = i === JOB_PRIORITY_ORDER.length - 1;
 
-  const entry = parseFirstEntry(response);
-  if (!entry) {
-    return null;
+    // Two separate fixed-arity calls rather than conditionally spreading a
+    // 'BLOCK' option in — ioredis's xreadgroup overloads resolve by exact
+    // argument shape, and a spread of variable length defeats that
+    // resolution (TS can't tell which overload a spread might produce).
+    const response = isLastTier
+      ? await redis.xreadgroup('GROUP', CONSUMER_GROUP, consumerName, 'COUNT', 1, 'BLOCK', blockMs, 'STREAMS', streamKey, '>')
+      : await redis.xreadgroup('GROUP', CONSUMER_GROUP, consumerName, 'COUNT', 1, 'STREAMS', streamKey, '>');
+
+    const entry = parseFirstEntry(response);
+    if (entry) {
+      return processEntry(prisma, redis, logger, streamKey, entry.entryId, entry.fields);
+    }
   }
-  return processEntry(prisma, redis, logger, entry.entryId, entry.fields);
+  return null;
 }
 
 /**
@@ -255,6 +272,10 @@ function parseClaimedEntries(response: unknown): { entryId: string; fields: stri
  * simply picked up on the next sweep (idle time only grows), which avoids
  * needing any cursor state at all for a sweep that already runs every few
  * seconds.
+ *
+ * Milestone 10: each priority tier has its own stream, hence its own PEL —
+ * this sweeps all three every call, high to low, rather than needing a
+ * separate sweep timer per tier.
  */
 export async function reclaimStaleEntries(
   prisma: PrismaClient,
@@ -264,26 +285,23 @@ export async function reclaimStaleEntries(
   idleMs: number,
   count = 10,
 ): Promise<ProcessedJob[]> {
-  const response = await redis.xautoclaim(
-    JOBS_STREAM_KEY,
-    CONSUMER_GROUP,
-    consumerName,
-    idleMs,
-    '0',
-    'COUNT',
-    count,
-  );
-
-  const entries = parseClaimedEntries(response);
-  if (entries.length === 0) {
-    return [];
-  }
-
-  logger.info({ count: entries.length, consumerName }, 'Reclaimed stale PEL entries');
-
   const results: ProcessedJob[] = [];
-  for (const { entryId, fields } of entries) {
-    results.push(await processEntry(prisma, redis, logger, entryId, fields));
+
+  for (const priority of JOB_PRIORITY_ORDER) {
+    const streamKey = JOBS_STREAM_KEYS[priority];
+    const response = await redis.xautoclaim(streamKey, CONSUMER_GROUP, consumerName, idleMs, '0', 'COUNT', count);
+
+    const entries = parseClaimedEntries(response);
+    if (entries.length === 0) {
+      continue;
+    }
+
+    logger.info({ count: entries.length, consumerName, priority }, 'Reclaimed stale PEL entries');
+
+    for (const { entryId, fields } of entries) {
+      results.push(await processEntry(prisma, redis, logger, streamKey, entryId, fields));
+    }
   }
+
   return results;
 }

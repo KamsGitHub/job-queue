@@ -1,7 +1,7 @@
 import { buildApp } from '../app';
 import { createPrismaClient } from '../db/client';
 import { createRedisClient } from '../queue/redis';
-import { JOBS_STREAM_KEY } from '../queue/stream';
+import { JOBS_STREAM_KEYS } from '../queue/stream';
 
 describe('POST /jobs', () => {
   // Shared across tests in this file, not per-test: buildApp() only closes
@@ -44,11 +44,11 @@ describe('POST /jobs', () => {
 
     // Same logic for the stream side: prove the job was actually announced
     // on the stream, not just that the handler didn't throw.
-    const entries = await redis.xrevrange(JOBS_STREAM_KEY, '+', '-', 'COUNT', 20);
+    const entries = await redis.xrevrange(JOBS_STREAM_KEYS.NORMAL, '+', '-', 'COUNT', 20);
     const match = entries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === body.id);
     expect(match).toBeDefined();
     if (match) {
-      await redis.xdel(JOBS_STREAM_KEY, match[0]);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, match[0]);
     }
 
     await app.close();
@@ -86,11 +86,53 @@ describe('POST /jobs', () => {
 
     // Only one stream entry was ever produced — the second request must
     // not have enqueued a duplicate.
-    const entries = await redis.xrevrange(JOBS_STREAM_KEY, '+', '-', 'COUNT', 20);
+    const entries = await redis.xrevrange(JOBS_STREAM_KEYS.NORMAL, '+', '-', 'COUNT', 20);
     const matches = entries.filter(([, fields]) => fields[fields.indexOf('jobId') + 1] === firstBody.id);
     expect(matches).toHaveLength(1);
     if (matches[0]) {
-      await redis.xdel(JOBS_STREAM_KEY, matches[0][0]);
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, matches[0][0]);
+    }
+
+    await app.close();
+  });
+
+  it('defaults priority to NORMAL, and honors an explicit priority by enqueueing onto that tier\'s stream', async () => {
+    const app = buildApp({ prisma, redis });
+
+    const defaultResponse = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'default-priority@example.com' } },
+    });
+    expect(defaultResponse.statusCode).toBe(201);
+    const defaultBody = defaultResponse.json();
+    expect(defaultBody.priority).toBe('NORMAL');
+    createdJobIds.push(defaultBody.id);
+
+    const highResponse = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'high-priority@example.com' }, priority: 'HIGH' },
+    });
+    expect(highResponse.statusCode).toBe(201);
+    const highBody = highResponse.json();
+    expect(highBody.priority).toBe('HIGH');
+    createdJobIds.push(highBody.id);
+
+    // Proves it was actually dispatched onto the HIGH stream, not just
+    // stamped in Postgres.
+    const highEntries = await redis.xrevrange(JOBS_STREAM_KEYS.HIGH, '+', '-', 'COUNT', 20);
+    const highMatch = highEntries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === highBody.id);
+    expect(highMatch).toBeDefined();
+    if (highMatch) {
+      await redis.xdel(JOBS_STREAM_KEYS.HIGH, highMatch[0]);
+    }
+
+    const normalEntries = await redis.xrevrange(JOBS_STREAM_KEYS.NORMAL, '+', '-', 'COUNT', 20);
+    const normalMatch = normalEntries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === defaultBody.id);
+    expect(normalMatch).toBeDefined();
+    if (normalMatch) {
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, normalMatch[0]);
     }
 
     await app.close();
