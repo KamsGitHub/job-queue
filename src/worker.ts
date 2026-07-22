@@ -3,6 +3,7 @@ import { createPrismaClient } from './db/client';
 import { createRedisClient } from './queue/redis';
 import { ensureConsumerGroups } from './queue/stream';
 import { processNextJob, reclaimStaleEntries } from './queue/consumer';
+import { promoteDueJobs } from './queue/schedule';
 import { createLogger } from './logger';
 import { env } from './config/env';
 
@@ -56,11 +57,46 @@ function startStaleEntrySweep(): NodeJS.Timeout {
   }, env.WORKER_STALE_SWEEP_INTERVAL_MS);
 }
 
+/**
+ * Milestone 11: an independent sweep, on its own timer, that promotes due
+ * scheduled jobs onto their priority stream (see queue/schedule.ts). Reuses
+ * sweepRedis rather than a third dedicated connection — ZRANGEBYSCORE/ZREM
+ * are non-blocking commands, so they're safe on the same connection as the
+ * stale-entry sweep's XAUTOCLAIM/XACK (the rule from Milestone 6 is about
+ * never sharing a connection between a *blocking* command and others; two
+ * non-blocking sweeps sharing one connection is fine). `promoting` mirrors
+ * `sweeping`'s overlap guard, kept as a separate flag since the two sweeps
+ * are independent concerns that shouldn't block each other's ticks.
+ */
+let promoting: Promise<void> | null = null;
+
+function startScheduleSweep(): NodeJS.Timeout {
+  return setInterval(() => {
+    if (promoting) {
+      return;
+    }
+    promoting = promoteDueJobs(prisma, sweepRedis, logger)
+      .then(() => undefined)
+      .catch((err: unknown) => {
+        logger.error({ err }, 'Error while promoting scheduled jobs');
+      })
+      .finally(() => {
+        promoting = null;
+      });
+  }, env.WORKER_SCHEDULE_SWEEP_INTERVAL_MS);
+}
+
 async function loop(): Promise<void> {
   await ensureConsumerGroups(redis);
   const sweepTimer = startStaleEntrySweep();
+  const scheduleSweepTimer = startScheduleSweep();
   logger.info(
-    { consumerName, sweepIntervalMs: env.WORKER_STALE_SWEEP_INTERVAL_MS, idleMs: env.WORKER_STALE_IDLE_MS },
+    {
+      consumerName,
+      sweepIntervalMs: env.WORKER_STALE_SWEEP_INTERVAL_MS,
+      idleMs: env.WORKER_STALE_IDLE_MS,
+      scheduleSweepIntervalMs: env.WORKER_SCHEDULE_SWEEP_INTERVAL_MS,
+    },
     'Worker started, listening on jobs:stream:high / :normal / :low',
   );
 
@@ -78,11 +114,15 @@ async function loop(): Promise<void> {
   }
 
   clearInterval(sweepTimer);
-  // The interval is stopped, but a sweep it already kicked off may still be
-  // running (reclaiming + reprocessing several entries can take a moment) —
-  // wait for it rather than disconnecting Postgres/Redis out from under it.
+  clearInterval(scheduleSweepTimer);
+  // The intervals are stopped, but a sweep either already kicked off may
+  // still be running — wait for both rather than disconnecting Postgres/
+  // Redis out from under them.
   if (sweeping) {
     await sweeping;
+  }
+  if (promoting) {
+    await promoting;
   }
 }
 

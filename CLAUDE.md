@@ -29,8 +29,8 @@ OpenAPI/Swagger.
 
 **Phase 2 — Correctness Under Concurrency**
 9. Idempotency & exactly-once effects — done
-10. Priority queues ← **currently here, see status below**
-11. Scheduled & delayed jobs
+10. Priority queues — done
+11. Scheduled & delayed jobs ← **currently here, see status below**
 
 **Phase 3 — Making It a Real Service**
 12. Auth, API keys & multi-tenancy
@@ -775,6 +775,104 @@ entries and cause spurious, non-deterministic failures that look like
 product bugs but are purely test-environment contamination. Always stop
 any locally-running `npm run dev`/`npm run worker` before trusting an
 `npm test` result, and restart them afterward for manual use.
+
+## Status: Milestone 11 (Scheduled & Delayed Jobs)
+
+Key architectural decision made before implementing: Redis Streams have no
+"deliver later" primitive — an entry is visible to XREADGROUP the instant
+it's XADD'd, so a not-yet-due job can't simply be enqueued onto its
+priority stream the way an immediate job is. Two designs were considered:
+
+- Rejected: give each job a per-job Redis timer/expiry (e.g. a key with TTL
+  and a keyspace-notification handler) that triggers enqueue on expiry.
+  Keyspace notifications aren't guaranteed delivery (a subscriber that's
+  briefly disconnected misses the event entirely) — wrong reliability
+  properties for "this job must eventually run."
+- **Chosen: a single Redis sorted set** (`jobs:scheduled`, `queue/schedule.ts`),
+  scored by due time (epoch ms), member = job ID. A dedicated sweep
+  (`promoteDueJobs`, on its own worker timer) polls it for due entries and
+  XADDs each onto its ordinary priority stream via the *existing*
+  `enqueueJob()` — from that point on a promoted job is completely
+  indistinguishable from an immediately-dispatched one; nothing in
+  `processEntry` needed to change at all.
+
+Implemented:
+- New migration (`prisma/migrations/..._add_scheduled_at/`): `Job.scheduledAt
+  DateTime?`. Deliberately a separate field from `nextRetryAt` (M7) even
+  though both are "don't run the handler until this time" — one is
+  eligibility *before* the first attempt, the other is backoff *after* a
+  failed one; conflating them would risk a retry's backoff deadline being
+  misread as "still scheduled," or vice versa.
+- `job.schema.ts`: `POST /jobs` accepts *either* an absolute `scheduledAt`
+  or a relative `delaySeconds`, mutually exclusive (Zod `.refine()`, 400 if
+  both given), resolved by a `.transform()` into one `scheduledAt: Date |
+  undefined` — every downstream consumer (repository, route) only ever
+  handles one field, not "check both." Uses the same conditional-spread
+  `exactOptionalPropertyTypes` pattern as `idempotencyKey`/`priority`
+  before it, so the resolved field is truly absent (not
+  present-with-value-`undefined`) when no scheduling was requested — this
+  matters for every existing test/call site that constructs a
+  `CreateJobInput` directly without going through the Zod parse.
+- `queue/schedule.ts`: `scheduleJob(redis, jobId, scheduledAt)` — one
+  `ZADD`. `promoteDueJobs(prisma, redis, logger, now?, limit=100)` —
+  `ZRANGEBYSCORE` for due entries, then **`ZREM` before `XADD`** per
+  member, not the other order. This ordering is a deliberate tradeoff, not
+  an oversight: this project runs multiple worker processes concurrently
+  as the *normal* case (Milestones 5/10), so if `XADD` came first, every
+  worker's sweep would see the same due job on every tick until its own
+  `ZREM` eventually ran — routinely double-promoting it, not just in a
+  rare crash window. `ZREM`'s return value (1 vs 0) is the atomic claim:
+  only the sweep call that actually removed the member proceeds to
+  promote it, so concurrent workers never race to promote the same job
+  twice. The accepted cost: if a worker crashes between its own `ZREM` and
+  `XADD`, that job is silently lost — removed from the scheduled set,
+  never reaching a stream, permanently `PENDING` in Postgres. Named here
+  rather than solved, the same way the still-open `markJobSucceeded`-to-
+  `XACK` crash window has been since Milestone 6 — this project's
+  consistent stance is to document these narrow multi-command crash
+  windows rather than add machinery for them.
+- `routes/jobs.ts`: after `findOrCreateJob`, checks
+  `job.scheduledAt.getTime() > Date.now()` — if scheduled for later, calls
+  `scheduleJob` instead of `enqueueJob`; if `scheduledAt` is absent or
+  already in the past (e.g. a slow request, or a client-provided timestamp
+  that's already elapsed), dispatches immediately exactly as before this
+  milestone. Permissive by design — no error for "scheduledAt already
+  passed."
+- `worker.ts`: a second independent sweep (`startScheduleSweep`,
+  `WORKER_SCHEDULE_SWEEP_INTERVAL_MS`, default 1000ms — tighter than the
+  5s stale-entry sweep, since this interval directly bounds how late a
+  scheduled job can start relative to its target time) reuses `sweepRedis`
+  rather than a third dedicated connection: `ZRANGEBYSCORE`/`ZREM` are
+  non-blocking commands, and the Milestone 6 rule ("never share a
+  connection between a blocking command and other concurrent commands")
+  only prohibits sharing with a *blocking* one — two non-blocking sweeps
+  on one connection is fine. Its own `promoting` overlap guard, separate
+  from `sweeping`, since the two sweeps are independent concerns.
+
+Tests: new `queue/schedule.test.ts` covers `scheduleJob` holding a job off
+every priority stream, `promoteDueJobs` leaving a future-scheduled job
+untouched, promoting a due job and having it process normally afterward
+via the ordinary `processNextJob` path, the concurrent-claim race (two
+simultaneous `promoteDueJobs` calls only promote once), and the dropped-
+row case (a due entry whose Postgres row was deleted logs and moves on
+rather than crashing). `routes/jobs.test.ts` adds cases for: holding a
+future `scheduledAt` off the streams and in the scheduled set with the
+right score; `delaySeconds` resolving to an equivalent `scheduledAt`;
+rejecting both fields given together; and dispatching immediately when
+`scheduledAt` is already in the past.
+
+Manually verified against live `npm run dev` + `npm run worker` + real
+Postgres/Redis: stopped the worker, submitted a job with `delaySeconds: 4`,
+confirmed immediately afterward it was sitting in `jobs:scheduled` (score
+matching its `scheduledAt`) with zero presence on any of the three
+priority streams, waited past the delay, restarted the worker, and
+watched its very first schedule-sweep tick log `'Promoted scheduled job
+onto its priority stream'` followed immediately by normal dispatch and
+`SUCCEEDED`. Also observed a small (~2-3s) gap between promotion and
+actual processing in an earlier live run — traced to the already-
+documented Milestone 10 tradeoff (the main loop can be mid-`BLOCK` on the
+lowest-priority stream when a promotion lands on a higher one, bounded by
+`blockMs`), not a new issue introduced by this milestone.
 
 ## Design decisions worth preserving
 

@@ -2,6 +2,7 @@ import { buildApp } from '../app';
 import { createPrismaClient } from '../db/client';
 import { createRedisClient } from '../queue/redis';
 import { JOBS_STREAM_KEYS } from '../queue/stream';
+import { SCHEDULED_JOBS_KEY } from '../queue/schedule';
 
 describe('POST /jobs', () => {
   // Shared across tests in this file, not per-test: buildApp() only closes
@@ -135,6 +136,103 @@ describe('POST /jobs', () => {
       await redis.xdel(JOBS_STREAM_KEYS.NORMAL, normalMatch[0]);
     }
 
+    await app.close();
+  });
+
+  it('holds a job with a future scheduledAt in the scheduled set instead of dispatching it immediately', async () => {
+    const app = buildApp({ prisma, redis });
+    const scheduledAt = new Date(Date.now() + 60_000).toISOString();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'scheduled@example.com' }, scheduledAt },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    expect(body.status).toBe('PENDING');
+    expect(new Date(body.scheduledAt).toISOString()).toBe(scheduledAt);
+    createdJobIds.push(body.id);
+
+    // Not dispatched onto any priority stream yet...
+    for (const streamKey of Object.values(JOBS_STREAM_KEYS)) {
+      const entries = await redis.xrange(streamKey, '-', '+');
+      expect(entries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === body.id)).toBeUndefined();
+    }
+    // ...but sitting in the scheduled set, due at exactly the requested time.
+    const score = await redis.zscore(SCHEDULED_JOBS_KEY, body.id);
+    expect(Number(score)).toBe(new Date(scheduledAt).getTime());
+
+    await redis.zrem(SCHEDULED_JOBS_KEY, body.id);
+    await app.close();
+  });
+
+  it('resolves delaySeconds to an equivalent scheduledAt and holds the job the same way', async () => {
+    const app = buildApp({ prisma, redis });
+    const before = Date.now();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'delayed@example.com' }, delaySeconds: 60 },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    createdJobIds.push(body.id);
+
+    const scheduledAtMs = new Date(body.scheduledAt).getTime();
+    expect(scheduledAtMs).toBeGreaterThanOrEqual(before + 60_000);
+    expect(scheduledAtMs).toBeLessThan(before + 65_000);
+
+    expect(await redis.zscore(SCHEDULED_JOBS_KEY, body.id)).not.toBeNull();
+
+    await redis.zrem(SCHEDULED_JOBS_KEY, body.id);
+    await app.close();
+  });
+
+  it('rejects a request providing both scheduledAt and delaySeconds', async () => {
+    const app = buildApp({ prisma, redis });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: {
+        type: 'send-email',
+        payload: { to: 'ambiguous@example.com' },
+        scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+        delaySeconds: 60,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('dispatches immediately when scheduledAt is already in the past', async () => {
+    const app = buildApp({ prisma, redis });
+    const scheduledAt = new Date(Date.now() - 1000).toISOString();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/jobs',
+      payload: { type: 'send-email', payload: { to: 'already-due@example.com' }, scheduledAt },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    createdJobIds.push(body.id);
+
+    const entries = await redis.xrevrange(JOBS_STREAM_KEYS.NORMAL, '+', '-', 'COUNT', 20);
+    const match = entries.find(([, fields]) => fields[fields.indexOf('jobId') + 1] === body.id);
+    expect(match).toBeDefined();
+    expect(await redis.zscore(SCHEDULED_JOBS_KEY, body.id)).toBeNull();
+
+    if (match) {
+      await redis.xdel(JOBS_STREAM_KEYS.NORMAL, match[0]);
+    }
     await app.close();
   });
 

@@ -22,6 +22,10 @@ export async function createJob(prisma: PrismaClient, data: CreateJobInput) {
       // when absent, which Prisma's optional field type rejects. Spread it
       // in only when actually provided, so the key is truly absent instead.
       ...(data.idempotencyKey ? { idempotencyKey: data.idempotencyKey } : {}),
+      // Same gotcha, same fix: data.scheduledAt is already fully resolved
+      // (job.schema.ts's transform collapses scheduledAt/delaySeconds into
+      // this one field) but is `Date | undefined`, not always-present.
+      ...(data.scheduledAt ? { scheduledAt: data.scheduledAt } : {}),
     },
   });
 }

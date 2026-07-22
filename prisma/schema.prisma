@@ -54,6 +54,16 @@ model Job {
   // enqueued onto already encodes that.
   priority JobPriority @default(NORMAL)
 
+  // Milestone 11: null means "eligible for dispatch immediately" (the
+  // existing behavior, unchanged). When set to a future time, POST /jobs
+  // holds the job in a Redis sorted set (see queue/schedule.ts) instead of
+  // enqueueing it onto its priority stream right away — a background sweep
+  // promotes it once due. Deliberately separate from nextRetryAt below:
+  // that field is about backoff *after* a failed attempt, this one is about
+  // eligibility *before* the first attempt — conflating the two would mean
+  // a retry accidentally re-triggering "still scheduled" logic or vice versa.
+  scheduledAt DateTime?
+
   // Milestone 7: retry tracking. attempts increments on every failure;
   // nextRetryAt is the exponential-backoff-with-jitter deadline before
   // which processEntry() declines to re-run a failed job's handler, even

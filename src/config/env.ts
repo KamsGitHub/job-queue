@@ -37,6 +37,12 @@ const envSchema = z.object({
   // real job-duration data.
   WORKER_RETRY_BASE_MS: z.coerce.number().int().positive().default(1000),
   WORKER_RETRY_MAX_MS: z.coerce.number().int().positive().default(60000),
+  // Milestone 11 scheduled/delayed jobs: how often the worker sweeps the
+  // scheduled set for due jobs to promote onto their priority stream.
+  // Tighter than the stale-entry sweep above (1s vs 5s) since this interval
+  // directly bounds how late a scheduled job can start relative to its
+  // target time — still a placeholder pending real usage data.
+  WORKER_SCHEDULE_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(1000),
 });
 
 export type Env = z.infer<typeof envSchema>;
