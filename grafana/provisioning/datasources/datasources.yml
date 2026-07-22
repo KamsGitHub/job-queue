@@ -1,0 +1,36 @@
+apiVersion: 1
+
+datasources:
+  - name: Postgres
+    uid: jobqueue-postgres
+    type: postgres
+    access: proxy
+    # Docker-internal service name/port (docker-compose network), not
+    # localhost:5432 — Grafana's Postgres queries run server-side inside
+    # the grafana container, which reaches Postgres as a sibling service.
+    url: postgres:5432
+    database: jobqueue
+    user: jobqueue
+    jsonData:
+      # Grafana 12.2+ regression: the query editor's "default database"
+      # check reads jsonData.database specifically, not just the
+      # top-level `database` field used for the actual connection — omit
+      # this and every query fails with "you do not currently have a
+      # default database configured for this data source" even though
+      # the connection itself works fine (datasource health check passes).
+      database: jobqueue
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: jobqueue
+
+  - name: Redis
+    uid: jobqueue-redis
+    type: redis-datasource
+    access: proxy
+    url: redis://redis:6379
+    jsonData:
+      poolSize: 5
+      timeout: 10
+      pingInterval: 0
+      pipelineWindow: 0

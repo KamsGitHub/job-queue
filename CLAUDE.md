@@ -11,7 +11,7 @@ groups, delivery semantics, crash recovery, retries, backpressure.
 
 Stack: Node.js, TypeScript (strict), Fastify, PostgreSQL, Redis Streams,
 Prisma, Zod, Pino, Docker/Docker Compose, Jest, ESLint + Prettier,
-OpenAPI/Swagger.
+OpenAPI/Swagger, Grafana (dashboard, see "Status: Grafana Dashboard").
 
 ## Roadmap (15 milestones)
 
@@ -30,9 +30,9 @@ OpenAPI/Swagger.
 **Phase 2 — Correctness Under Concurrency**
 9. Idempotency & exactly-once effects — done
 10. Priority queues — done
-11. Scheduled & delayed jobs ← **currently here, see status below**
+11. Scheduled & delayed jobs — done
 
-**Phase 3 — Making It a Real Service**
+**Phase 3 — Making It a Real Service (postponed)**
 12. Auth, API keys & multi-tenancy
 13. Rate limiting & quotas (token bucket, Lua scripts for atomicity)
 14. Observability: Prometheus metrics, structured logging tied to job IDs
@@ -40,6 +40,14 @@ OpenAPI/Swagger.
 
 Optional Phase 4 (only if time remains): web dashboard, CI/CD, Grafana.
 Not required for the portfolio thesis — depth over breadth.
+
+**Deliberate reordering**: Phase 3 is paused (not abandoned) in favor of
+pulling the Phase 4 Grafana dashboard forward — see "Status: Grafana
+Dashboard" below. Milestones 1-11 gave the queue a full, real mechanism
+(consumer groups, crash recovery, retries, DLQ, idempotency, priority,
+scheduling); a dashboard to actually see and poke at that mechanism was
+judged more valuable right now than auth/rate-limiting/metrics on an
+API with no visible face yet.
 
 ## Status: Milestone 1 (Project Skeleton & Environment)
 
@@ -873,6 +881,147 @@ actual processing in an earlier live run — traced to the already-
 documented Milestone 10 tradeoff (the main loop can be mid-`BLOCK` on the
 lowest-priority stream when a promotion lands on a higher one, bounded by
 `blockMs`), not a new issue introduced by this milestone.
+
+## Status: Grafana Dashboard (Phase 4, pulled forward)
+
+The user asked for a custom dashboard with buttons to submit jobs, then
+mid-discussion switched the plan to Grafana + community plugins instead
+of a hand-rolled React frontend. Two real architectural decisions were
+made before implementing:
+
+- **Grafana talks to Postgres and Redis directly as native data
+  sources — no new REST endpoints were added to the API.** Read-side
+  observability (job counts by status, the recent-jobs table, per-tier
+  stream lengths, the scheduled-set size, dead-letter stream length) is
+  entirely SQL/Redis-command queries Grafana's backend runs itself
+  against the same `postgres`/`redis` docker-compose services the app
+  already uses. Only the *write* side (submitting a new job) touches the
+  app at all, via the existing `POST /jobs`.
+- **The submit panel does a direct browser-side POST, not a
+  datasource-proxied one.** The plugin used for this
+  (`volkovlabs-form-panel`, "Business Forms") supports two request
+  modes — `RequestMethod.DATASOURCE` (proxied server-side through a
+  configured datasource, e.g. a JSON API datasource) or a direct
+  `fetch()` from the browser for `POST`/`PUT`/`PATCH`/`DELETE`. Confirmed
+  by reading the plugin's actual source
+  (`FormPanel.tsx`'s update handler calls plain `fetch(url, {method,
+  headers, body})` for non-DATASOURCE methods) rather than assumed.
+  Direct POST was chosen because it needs nothing beyond CORS: the
+  browser already runs on the same host as the API (`localhost:3000`),
+  so no `host.docker.internal` cross-container networking is needed for
+  the write path at all — only Postgres/Redis (queried server-side, from
+  *inside* the Grafana container) need docker-compose service-name
+  resolution (`postgres:5432`, `redis:6379`), which is ordinary
+  same-network container DNS, nothing special.
+
+**Both plugins were verified against their actual behavior before
+committing to this design**, not assumed from prose docs (which turned
+out to be thin/unhelpful for exact schemas — see below):
+- `volkovlabs-form-panel` (Business Forms): the archived-but-still-
+  functional plugin (Volkov Labs ceased operations Sept 2026 after an
+  acquisition; the last released version, 6.3.5, still installs and
+  works fine, just won't get further updates). Its official docs pages
+  didn't contain the actual options JSON schema, so the plugin's own
+  TypeScript source (`src/types/*.ts`, `src/constants/default.ts`) was
+  pulled directly via `gh api` to get the real `PanelOptions`/
+  `RequestOptions`/`FormElement` shapes, the exact `context.panel.elements`
+  API available inside custom "getPayload" code, and — critically — the
+  `isSubmitDisabled` logic in `FormPanel.tsx` itself, which is what
+  confirmed `updateEnabled: 'auto'` + `layout.variant: 'single'` +
+  giving every element a non-empty default `value` keeps the Submit
+  button enabled from first render (the `isUpdated` check compares each
+  element's value against an empty `initial` map, and any non-empty
+  default is therefore already "different"). The three "quick action"
+  panels intentionally use `layout.variant: 'none'` ("Buttons only")
+  instead — confirmed via the same source read that this mode makes
+  `isSubmitDisabled` unconditionally `false`, since a quick-action button
+  has no fields to "change" at all.
+- `redis-datasource`: provisioning shape and the CLI query target format
+  (`{"type": "cli", "query": "xlen jobs:stream:high"}`) came from the
+  plugin's own shipped example dashboards
+  (`src/dashboards/redis-streaming-v8.json` in its repo), not guessed —
+  those are real, working panel configs the plugin's own authors ship
+  and presumably keep in sync with the current query engine.
+
+Implemented:
+- `docker-compose.yml`: new `grafana` service (`grafana/grafana:latest`),
+  `GF_INSTALL_PLUGINS: volkovlabs-form-panel,redis-datasource`, port
+  `3001:3000` (3000 stays the API's), `extra_hosts:
+  host.docker.internal:host-gateway` (kept as cheap insurance for any
+  future panel that does need it, even though the current form doesn't),
+  a named volume for Grafana's own state, and the `grafana/provisioning/`
+  tree bind-mounted in.
+- `grafana/provisioning/datasources/datasources.yml`: Postgres and Redis
+  data sources with **fixed `uid`s** (`jobqueue-postgres`,
+  `jobqueue-redis`) set explicitly rather than left to Grafana's
+  auto-generated ones — required so the dashboard JSON (provisioned
+  separately) can reference them deterministically without a chicken-
+  and-egg "look up the uid after the fact" step.
+- `grafana/provisioning/dashboards/`: `dashboards.yml` (file provider)
+  plus `job-queue.json`, generated by a throwaway Python script (not
+  hand-typed) specifically to embed multi-line JavaScript "getPayload"/
+  response-handler code as properly-escaped JSON string values without
+  manual escaping mistakes. The dashboard has three rows: **Submit a
+  Job** (the full custom form, plus three one-click quick-action panels
+  demonstrating priority dispatch, the retry→dead-letter path, and
+  delayed scheduling), **Postgres — Job State** (a stat panel per
+  `JobStatus` value, plus a recent-jobs table), and **Redis — Queue
+  Internals** (stream length per priority tier, scheduled-set
+  cardinality, dead-letter stream length).
+- `src/app.ts`: registered `@fastify/cors` (pinned to the `^9` line —
+  `@fastify/cors@11` requires Fastify 5, and this project is still on
+  Fastify 4; installing the wrong major broke every test with a
+  `fastify-plugin: expected '5.x' fastify version` error, caught
+  immediately by the existing test suite), scoped to the one known
+  origin (`http://localhost:3001`, Grafana's port) rather than a
+  wildcard.
+
+Verified without a browser (none available in this environment) by
+exercising Grafana's own HTTP API directly: both datasources report
+`"status": "OK"` via `/api/datasources/uid/<uid>/health`; the dashboard
+loads via `/api/dashboards/uid/job-queue-dashboard` with all 18
+panels/rows intact; a representative Postgres query and a representative
+Redis `cli` query were both run directly through `/api/ds/query` and
+returned real data; and the exact request the form's "getPayload" code
+would produce was replayed by hand with `curl -H "Origin:
+http://localhost:3001"` against the live API — confirming both the CORS
+preflight (`OPTIONS`) and the real `POST` succeed with the right
+`Access-Control-Allow-Origin` header, for all three payload shapes (the
+main form, and both quick-action buttons). **What wasn't verified**:
+actually clicking the button in a real browser — that's a genuine gap
+this approach can't close without one, flagged explicitly rather than
+claimed. Login: `admin` / `admin` (docker-compose env vars, local-dev
+only, matching this project's existing simple dev credentials for
+Postgres/Redis).
+
+**That gap caught a real bug the API-only checks above couldn't**: the
+first time the dashboard was actually opened in a browser, every
+Postgres panel failed with "you do not currently have a default database
+configured for this data source" — despite the datasource's health
+check passing and its top-level `database: jobqueue` field being set
+correctly (confirmed via `/api/ds/query` working before this was found).
+Root cause, confirmed via web research (a known Grafana regression
+starting in 12.2.0, still present in the 13.1.1 pulled here): the
+Postgres query editor's "default database" check reads
+`jsonData.database` specifically, a *different* field from the
+top-level `database` used for the actual connection — provisioning only
+the top-level field passes the connection health check but leaves every
+query erroring. Fixed by adding `database: jobqueue` inside
+`jsonData` too (`grafana/provisioning/datasources/datasources.yml`),
+alongside the existing top-level field, then `docker compose restart
+grafana`. Re-verified via `/api/ds/query` afterward. Worth remembering:
+Postgres/MySQL/MSSQL datasource provisioning on Grafana ≥12.2 needs
+`database` in both places, not just one.
+
+Also worth recording: `npm test` was intermittently failing 3-6 tests in
+`consumer.test.ts` during this work, traced to `consumer.test.ts` and
+`schedule.test.ts` racing each other over the *same* real Redis stream
+keys and consumer group when Jest runs test files in parallel (its
+default) — confirmed by re-running with `--runInBand`, which passed all
+27 tests cleanly every time. Pre-existing since `schedule.test.ts` was
+added in Milestone 11, not something this dashboard work introduced —
+noted here rather than fixed, since it wasn't what was asked for this
+round.
 
 ## Design decisions worth preserving
 

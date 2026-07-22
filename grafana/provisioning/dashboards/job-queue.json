@@ -1,0 +1,1053 @@
+{
+  "id": null,
+  "uid": "job-queue-dashboard",
+  "title": "Job Queue",
+  "tags": [
+    "job-queue"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 16,
+      "type": "row",
+      "title": "Submit a Job",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "volkovlabs-form-panel",
+      "title": "Submit a Job",
+      "gridPos": {
+        "h": 11,
+        "w": 10,
+        "x": 0,
+        "y": 1
+      },
+      "options": {
+        "sync": false,
+        "initial": {
+          "method": "-",
+          "url": "",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "all",
+          "getPayload": "return {}",
+          "payload": {}
+        },
+        "updateEnabled": "auto",
+        "update": {
+          "method": "POST",
+          "url": "http://localhost:3000/jobs",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "if (context.panel.response && context.panel.response.ok) {\n  context.grafana.notifySuccess(['Job submitted', 'The job was added to the queue.']);\n  context.grafana.refresh();\n} else {\n  context.grafana.notifyError(['Submission failed', 'Check the Job Type and Payload JSON and try again.']);\n}",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "custom",
+          "getPayload": "const payload = {};\ncontext.panel.elements.forEach((element) => {\n  if (element.value === null || element.value === undefined || element.value === '') {\n    return;\n  }\n  if (element.id === 'payload') {\n    payload.payload = JSON.parse(element.value);\n  } else if (element.id === 'delaySeconds') {\n    payload.delaySeconds = Number(element.value);\n  } else {\n    payload[element.id] = element.value;\n  }\n});\nreturn payload;",
+          "payload": {}
+        },
+        "resetAction": {
+          "mode": "initial",
+          "code": "",
+          "datasource": "",
+          "getPayload": "return {}",
+          "payload": {},
+          "confirm": false
+        },
+        "buttonGroup": {
+          "orientation": "center",
+          "size": "md"
+        },
+        "submit": {
+          "variant": "primary",
+          "text": "Submit Job",
+          "icon": "cloud-upload",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "reset": {
+          "variant": "hidden",
+          "text": "Reset",
+          "icon": "process",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "saveDefault": {
+          "variant": "hidden",
+          "text": "Save Default",
+          "icon": "save"
+        },
+        "elements": [
+          {
+            "uid": "el-type",
+            "id": "type",
+            "title": "Job Type",
+            "type": "string",
+            "labelWidth": 14,
+            "width": 24,
+            "tooltip": "",
+            "section": "",
+            "unit": "",
+            "value": "send-email"
+          },
+          {
+            "uid": "el-payload",
+            "id": "payload",
+            "title": "Payload (JSON)",
+            "type": "code",
+            "labelWidth": 14,
+            "width": 24,
+            "tooltip": "",
+            "section": "",
+            "unit": "",
+            "value": "{\n  \"to\": \"test@example.com\"\n}",
+            "height": 140,
+            "language": "json"
+          },
+          {
+            "uid": "el-priority",
+            "id": "priority",
+            "title": "Priority",
+            "type": "select",
+            "labelWidth": 14,
+            "width": 24,
+            "tooltip": "",
+            "section": "",
+            "unit": "",
+            "value": "NORMAL",
+            "options": [
+              {
+                "value": "LOW",
+                "label": "LOW"
+              },
+              {
+                "value": "NORMAL",
+                "label": "NORMAL"
+              },
+              {
+                "value": "HIGH",
+                "label": "HIGH"
+              }
+            ],
+            "optionsSource": "Custom",
+            "allowCustomValue": false
+          },
+          {
+            "uid": "el-delay",
+            "id": "delaySeconds",
+            "title": "Delay (seconds, optional)",
+            "type": "number",
+            "labelWidth": 14,
+            "width": 24,
+            "tooltip": "",
+            "section": "",
+            "unit": "",
+            "value": null,
+            "min": 0
+          }
+        ],
+        "layout": {
+          "variant": "single",
+          "sections": [],
+          "padding": 10,
+          "orientation": "vertical",
+          "sectionVariant": "default"
+        },
+        "confirmModal": {
+          "title": "Confirm",
+          "body": "Please confirm",
+          "columns": {
+            "include": [
+              "name",
+              "oldValue",
+              "newValue"
+            ],
+            "name": "Label",
+            "oldValue": "Old Value",
+            "newValue": "New Value"
+          },
+          "confirm": "Confirm",
+          "cancel": "Cancel",
+          "elementDisplayMode": "modified"
+        },
+        "elementValueChanged": ""
+      }
+    },
+    {
+      "id": 2,
+      "type": "volkovlabs-form-panel",
+      "title": "Quick: HIGH priority job",
+      "gridPos": {
+        "h": 11,
+        "w": 4,
+        "x": 10,
+        "y": 1
+      },
+      "options": {
+        "sync": false,
+        "initial": {
+          "method": "-",
+          "url": "",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "all",
+          "getPayload": "return {}",
+          "payload": {}
+        },
+        "updateEnabled": "auto",
+        "update": {
+          "method": "POST",
+          "url": "http://localhost:3000/jobs",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "if (context.panel.response && context.panel.response.ok) {\n  context.grafana.notifySuccess(['Job submitted', 'The job was added to the queue.']);\n  context.grafana.refresh();\n} else {\n  context.grafana.notifyError(['Submission failed', 'Check the Job Type and Payload JSON and try again.']);\n}",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "custom",
+          "getPayload": "return { type: 'send-email', payload: { to: 'quick-high@example.com' }, priority: 'HIGH' };",
+          "payload": {}
+        },
+        "resetAction": {
+          "mode": "initial",
+          "code": "",
+          "datasource": "",
+          "getPayload": "return {}",
+          "payload": {},
+          "confirm": false
+        },
+        "buttonGroup": {
+          "orientation": "center",
+          "size": "md"
+        },
+        "submit": {
+          "variant": "primary",
+          "text": "Quick: HIGH priority job",
+          "icon": "cloud-upload",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "reset": {
+          "variant": "hidden",
+          "text": "Reset",
+          "icon": "process",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "saveDefault": {
+          "variant": "hidden",
+          "text": "Save Default",
+          "icon": "save"
+        },
+        "elements": [],
+        "layout": {
+          "variant": "none",
+          "sections": [],
+          "padding": 10,
+          "orientation": "vertical",
+          "sectionVariant": "default"
+        },
+        "confirmModal": {
+          "title": "Confirm",
+          "body": "Please confirm",
+          "columns": {
+            "include": [
+              "name",
+              "oldValue",
+              "newValue"
+            ],
+            "name": "Label",
+            "oldValue": "Old Value",
+            "newValue": "New Value"
+          },
+          "confirm": "Confirm",
+          "cancel": "Cancel",
+          "elementDisplayMode": "modified"
+        },
+        "elementValueChanged": ""
+      }
+    },
+    {
+      "id": 3,
+      "type": "volkovlabs-form-panel",
+      "title": "Quick: job that will fail (\u2192 retries \u2192 dead-letter)",
+      "gridPos": {
+        "h": 11,
+        "w": 4,
+        "x": 14,
+        "y": 1
+      },
+      "options": {
+        "sync": false,
+        "initial": {
+          "method": "-",
+          "url": "",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "all",
+          "getPayload": "return {}",
+          "payload": {}
+        },
+        "updateEnabled": "auto",
+        "update": {
+          "method": "POST",
+          "url": "http://localhost:3000/jobs",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "if (context.panel.response && context.panel.response.ok) {\n  context.grafana.notifySuccess(['Job submitted', 'The job was added to the queue.']);\n  context.grafana.refresh();\n} else {\n  context.grafana.notifyError(['Submission failed', 'Check the Job Type and Payload JSON and try again.']);\n}",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "custom",
+          "getPayload": "return { type: 'no-such-handler', payload: { demo: 'dead-letter' }, priority: 'NORMAL' };",
+          "payload": {}
+        },
+        "resetAction": {
+          "mode": "initial",
+          "code": "",
+          "datasource": "",
+          "getPayload": "return {}",
+          "payload": {},
+          "confirm": false
+        },
+        "buttonGroup": {
+          "orientation": "center",
+          "size": "md"
+        },
+        "submit": {
+          "variant": "primary",
+          "text": "Quick: job that will fail (\u2192 retries \u2192 dead-letter)",
+          "icon": "cloud-upload",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "reset": {
+          "variant": "hidden",
+          "text": "Reset",
+          "icon": "process",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "saveDefault": {
+          "variant": "hidden",
+          "text": "Save Default",
+          "icon": "save"
+        },
+        "elements": [],
+        "layout": {
+          "variant": "none",
+          "sections": [],
+          "padding": 10,
+          "orientation": "vertical",
+          "sectionVariant": "default"
+        },
+        "confirmModal": {
+          "title": "Confirm",
+          "body": "Please confirm",
+          "columns": {
+            "include": [
+              "name",
+              "oldValue",
+              "newValue"
+            ],
+            "name": "Label",
+            "oldValue": "Old Value",
+            "newValue": "New Value"
+          },
+          "confirm": "Confirm",
+          "cancel": "Cancel",
+          "elementDisplayMode": "modified"
+        },
+        "elementValueChanged": ""
+      }
+    },
+    {
+      "id": 4,
+      "type": "volkovlabs-form-panel",
+      "title": "Quick: delayed job (+15s)",
+      "gridPos": {
+        "h": 11,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "options": {
+        "sync": false,
+        "initial": {
+          "method": "-",
+          "url": "",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "all",
+          "getPayload": "return {}",
+          "payload": {}
+        },
+        "updateEnabled": "auto",
+        "update": {
+          "method": "POST",
+          "url": "http://localhost:3000/jobs",
+          "datasource": "",
+          "header": [],
+          "contentType": "application/json",
+          "code": "if (context.panel.response && context.panel.response.ok) {\n  context.grafana.notifySuccess(['Job submitted', 'The job was added to the queue.']);\n  context.grafana.refresh();\n} else {\n  context.grafana.notifyError(['Submission failed', 'Check the Job Type and Payload JSON and try again.']);\n}",
+          "highlight": false,
+          "highlightColor": "red",
+          "confirm": false,
+          "payloadMode": "custom",
+          "getPayload": "return { type: 'send-email', payload: { to: 'quick-delayed@example.com' }, priority: 'NORMAL', delaySeconds: 15 };",
+          "payload": {}
+        },
+        "resetAction": {
+          "mode": "initial",
+          "code": "",
+          "datasource": "",
+          "getPayload": "return {}",
+          "payload": {},
+          "confirm": false
+        },
+        "buttonGroup": {
+          "orientation": "center",
+          "size": "md"
+        },
+        "submit": {
+          "variant": "primary",
+          "text": "Quick: delayed job (+15s)",
+          "icon": "cloud-upload",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "reset": {
+          "variant": "hidden",
+          "text": "Reset",
+          "icon": "process",
+          "foregroundColor": "",
+          "backgroundColor": ""
+        },
+        "saveDefault": {
+          "variant": "hidden",
+          "text": "Save Default",
+          "icon": "save"
+        },
+        "elements": [],
+        "layout": {
+          "variant": "none",
+          "sections": [],
+          "padding": 10,
+          "orientation": "vertical",
+          "sectionVariant": "default"
+        },
+        "confirmModal": {
+          "title": "Confirm",
+          "body": "Please confirm",
+          "columns": {
+            "include": [
+              "name",
+              "oldValue",
+              "newValue"
+            ],
+            "name": "Label",
+            "oldValue": "Old Value",
+            "newValue": "New Value"
+          },
+          "confirm": "Confirm",
+          "cancel": "Cancel",
+          "elementDisplayMode": "modified"
+        },
+        "elementValueChanged": ""
+      }
+    },
+    {
+      "id": 17,
+      "type": "row",
+      "title": "Postgres \u2014 Job State",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Pending",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT count(*) FROM \"Job\" WHERE status = 'PENDING'",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Running",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 4,
+        "y": 13
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT count(*) FROM \"Job\" WHERE status = 'RUNNING'",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "yellow"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Succeeded",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 8,
+        "y": 13
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT count(*) FROM \"Job\" WHERE status = 'SUCCEEDED'",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Failed",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 12,
+        "y": 13
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT count(*) FROM \"Job\" WHERE status = 'FAILED'",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "orange"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Dead Lettered",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 16,
+        "y": 13
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT count(*) FROM \"Job\" WHERE status = 'DEAD_LETTERED'",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Recent Jobs",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "datasource": {
+        "type": "postgres",
+        "uid": "jobqueue-postgres"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT \"createdAt\", id, type, status, priority, attempts, \"maxAttempts\", \"scheduledAt\", error FROM \"Job\" ORDER BY \"createdAt\" DESC LIMIT 50",
+          "format": "table",
+          "datasource": {
+            "type": "postgres",
+            "uid": "jobqueue-postgres"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Redis \u2014 Queue Internals",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 29
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "HIGH stream length",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 0,
+        "y": 30
+      },
+      "datasource": {
+        "type": "redis-datasource",
+        "uid": "jobqueue-redis"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "cli",
+          "query": "xlen jobs:stream:high",
+          "command": "",
+          "datasource": {
+            "type": "redis-datasource",
+            "uid": "jobqueue-redis"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "NORMAL stream length",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 4,
+        "y": 30
+      },
+      "datasource": {
+        "type": "redis-datasource",
+        "uid": "jobqueue-redis"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "cli",
+          "query": "xlen jobs:stream:normal",
+          "command": "",
+          "datasource": {
+            "type": "redis-datasource",
+            "uid": "jobqueue-redis"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "LOW stream length",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 8,
+        "y": 30
+      },
+      "datasource": {
+        "type": "redis-datasource",
+        "uid": "jobqueue-redis"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "cli",
+          "query": "xlen jobs:stream:low",
+          "command": "",
+          "datasource": {
+            "type": "redis-datasource",
+            "uid": "jobqueue-redis"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "green"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Scheduled (not yet due)",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 12,
+        "y": 30
+      },
+      "datasource": {
+        "type": "redis-datasource",
+        "uid": "jobqueue-redis"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "cli",
+          "query": "zcard jobs:scheduled",
+          "command": "",
+          "datasource": {
+            "type": "redis-datasource",
+            "uid": "jobqueue-redis"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "purple"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Dead-letter stream length",
+      "gridPos": {
+        "h": 6,
+        "w": 4,
+        "x": 16,
+        "y": 30
+      },
+      "datasource": {
+        "type": "redis-datasource",
+        "uid": "jobqueue-redis"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "type": "cli",
+          "query": "xlen jobs:dead-letter",
+          "command": "",
+          "datasource": {
+            "type": "redis-datasource",
+            "uid": "jobqueue-redis"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "red"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      }
+    }
+  ]
+}

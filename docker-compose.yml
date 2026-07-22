@@ -33,6 +33,34 @@ services:
   # See README.md "Why the app isn't in docker-compose" for the reasoning.
   # A production Dockerfile is provided separately for CI/deployment.
 
+  # Optional Phase 4 dashboard (brought forward ahead of Phase 3): Grafana
+  # reads Postgres/Redis directly as native data sources (no new REST
+  # endpoints needed for that), and a Business Forms panel submits new jobs
+  # via a direct browser-side POST to the host-run API — hence CORS being
+  # enabled in src/app.ts and `extra_hosts` below (harmless even though the
+  # write path doesn't end up needing host.docker.internal; kept in case a
+  # future panel does).
+  grafana:
+    image: grafana/grafana:latest
+    container_name: jobqueue-grafana
+    ports:
+      - '3001:3000'
+    environment:
+      GF_INSTALL_PLUGINS: volkovlabs-form-panel,redis-datasource
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:
+  grafana_data:

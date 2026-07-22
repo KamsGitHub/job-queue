@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: 'Job Queue'
+    folder: ''
+    type: file
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/job-queue.json

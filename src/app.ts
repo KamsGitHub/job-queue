@@ -1,4 +1,5 @@
 import Fastify, { FastifyInstance } from 'fastify';
+import cors from '@fastify/cors';
 import { ZodError } from 'zod';
 import { env } from './config/env';
 import { healthRoutes } from './routes/health';
@@ -50,6 +51,13 @@ export function buildApp(deps: { prisma?: PrismaClient; redis?: Redis } = {}): F
         : {}),
     },
   });
+
+  // The Grafana dashboard's Business Forms panel (grafana/provisioning/)
+  // submits new jobs via a direct browser-side POST from Grafana's own
+  // origin (localhost:3001), not a server-side proxy — so it's a genuine
+  // cross-origin request needing CORS, not just a same-origin convenience.
+  // Scoped to that one known origin rather than a wildcard.
+  void app.register(cors, { origin: ['http://localhost:3001'] });
 
   // A single Zod-aware branch, everything else falls through to Fastify's
   // own default error serialization (respects error.statusCode, logs it,
